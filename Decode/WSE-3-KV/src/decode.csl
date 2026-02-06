@@ -11,7 +11,7 @@ param dim_p_pe: i16;
 param pes_p_head: i16;
 param pes_p_kv_head: i16;
 param head_dim_p_pe: i16;
-param seq_len_p_pe: i16;
+param max_seq_len_p_pe: i16;
 param ffn_dim_p_pe: i16;
 
 const _dim_p_pe: i16 = (dim_p_pe / 2) * 2;
@@ -50,6 +50,9 @@ var head_dim: f16 = @as(f16,P * head_dim_p_pe);
 
 const eps: f16 = 0.000001;
 var alpha: f16 = 0.0;
+var step: i16 = 0;
+var cur_kv_offset: i16 = 0;
+
 
 // -------------------------------------------------------------------------- //
 // --------------------------- WSE3 Modules Parameters ---------------------- //
@@ -61,7 +64,7 @@ const layout_mod = @import_module("<layout>");
 
 const comm_mod = @import_module("comm_lib/comm_pe.csl", @concat_structs(comm_params, .{ 
     .P = P, .bsz = bsz, .dim_p_pe = dim_p_pe,
-    .seq_len_p_pe = seq_len_p_pe,
+    // .seq_len_p_pe = seq_len_p_pe,
     .ffn_dim_p_pe = ffn_dim_p_pe,
     
     .pe_num_p_group = pe_num_p_group,
@@ -173,10 +176,12 @@ var out_vector_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &dummy, .extent = 1 
 
 var dim_p_pe_dsd_1 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{dim_p_pe} -> dummy[i] });
 var dim_p_pe_dsd_2 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{dim_p_pe} -> dummy[i] });
-var seq_len_p_pe_dsd_1 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe} -> dummy[i] });
-var seq_len_p_pe_dsd_2 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe} -> dummy[i] });
-var ffn_dim_p_pe_dsd_1 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{ffn_dim_p_pe} -> dummy[i] });
-var ffn_dim_p_pe_dsd_2 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{ffn_dim_p_pe} -> dummy[i] });
+// var seq_len_p_pe_dsd_1 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe} -> dummy[i] });
+// var seq_len_p_pe_dsd_2 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe} -> dummy[i] });
+var seq_len_p_pe_dsd_1 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> dummy[i] });
+var seq_len_p_pe_dsd_2 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> dummy[i] });
+// var ffn_dim_p_pe_dsd_1 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{ffn_dim_p_pe} -> dummy[i] });
+// var ffn_dim_p_pe_dsd_2 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{ffn_dim_p_pe} -> dummy[i] });
 
 var Kt: i16 = 0;
 var Nt: i16 = 0;
@@ -236,11 +241,11 @@ var freqs_cos: [_dim_p_pe / 2]f16 = @zeros([_dim_p_pe / 2]f16);
 var ptr_freqs_cos: [*]f16 = &freqs_cos;
 var freqs_cos_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &freqs_cos, .extent = _dim_p_pe / 2 });
 
-var XKCache_tile: [dim_p_pe * seq_len_p_pe]f16 = @zeros([dim_p_pe * seq_len_p_pe]f16);
+var XKCache_tile: [dim_p_pe * max_seq_len_p_pe * bsz]f16 = @zeros([dim_p_pe * max_seq_len_p_pe * bsz]f16);
 var ptr_XKCache: [*]f16 = &XKCache_tile;
 // var XKCache_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &XKCache_tile, .extent = seq_len_p_pe });
 
-var XVCache_tile: [seq_len_p_pe * dim_p_pe]f16 = @zeros([seq_len_p_pe * dim_p_pe]f16);
+var XVCache_tile: [max_seq_len_p_pe * dim_p_pe * bsz]f16 = @zeros([max_seq_len_p_pe * dim_p_pe * bsz]f16);
 var ptr_XVCache: [*]f16 = &XVCache_tile;
 // var XVCache_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &XVCache_tile, .extent = dim_p_pe });
 
@@ -324,13 +329,15 @@ var Q_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &QKV_tile, .offset = 0, .exte
 var K_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &QKV_tile, .offset = bsz*dim_p_pe, .extent = bsz*dim_p_pe });
 var V_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &QKV_tile, .offset = 2*bsz*dim_p_pe, .extent = bsz*dim_p_pe });
 
-var score: [bsz * seq_len_p_pe]f16 = @zeros([bsz * seq_len_p_pe]f16);
+var score: [bsz * max_seq_len_p_pe]f16 = @zeros([bsz * max_seq_len_p_pe]f16);
 var ptr_score: [*]f16 = &score;
-var score_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &score, .extent = bsz * seq_len_p_pe });
+// var score_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &score, .extent = bsz * seq_len_p_pe });
+var score_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &score, .extent = bsz * 1 });
 
-var score_tmp: [bsz * seq_len_p_pe]f16 = @zeros([bsz * seq_len_p_pe]f16);
+var score_tmp: [bsz * max_seq_len_p_pe]f16 = @zeros([bsz * max_seq_len_p_pe]f16);
 var ptr_score_tmp: [*]f16 = &score_tmp;
-var score_tmp_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &score_tmp, .extent = bsz * seq_len_p_pe });
+// var score_tmp_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &score_tmp, .extent = bsz * seq_len_p_pe });
+var score_tmp_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &score_tmp, .extent = bsz * 1 });
 
 var output_tile: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
 var ptr_output: [*]f16 = &output_tile;
@@ -548,7 +555,40 @@ fn xk_rope() void {
     }
 }
 
+
+
+fn memcpy(dest: *f16, src: *f16, size: u16) void {
+    var src_dsd = @get_dsd(mem1d_dsd, .{
+        .base_address = src,  
+        .extent = size,
+    });
+
+    var dest_dsd = @get_dsd(mem1d_dsd, .{
+        .base_address = dest, 
+        .extent = size,
+    });
+
+    @fmovs(dest_dsd, src_dsd);
+}
+
+fn process_kv() void {
+    var remain: i16 = step % P;
+    if (py == remain){
+        memcpy(&XKCache_tile[cur_kv_offset], &QKV_tile[bsz * dim_p_pe], bsz * dim_p_pe);
+        memcpy(&XVCache_tile[cur_kv_offset], &QKV_tile[bsz * dim_p_pe * 2], bsz * dim_p_pe);
+        cur_kv_offset += bsz * dim_p_pe;
+    }
+}
+
+
 fn score_matvec_mult() void {
+    Kt = dim_p_pe;
+    var block_size: i16 = bsz * dim_p_pe;
+    Nt = cur_kv_offset / block_size; //seq_len_p_pe;
+
+    score_dsd = @set_dsd_length(score_dsd, @as(u16, bsz * Nt));
+    score_tmp_dsd = @set_dsd_length(score_tmp_dsd, @as(u16, bsz * Nt));
+
     @fmovh(score_dsd, 0.0);
 
     left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_QKV_tile);
@@ -557,12 +597,13 @@ fn score_matvec_mult() void {
 
     out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_score);
 
-    Kt = dim_p_pe;
-    Nt = seq_len_p_pe;
+    // Kt = dim_p_pe;
+    // var block_size: i16 = bsz * dim_p_pe;
+    // Nt = cur_kv_offset / block_size; //seq_len_p_pe;
 
     vecmat_computation();
 
-    comm_mod.all_reduce_bsz_seq_len(px, quotient_x, remainder_x, ptr_score);
+    comm_mod.all_reduce_bsz_seq_len(px, quotient_x, remainder_x, Nt, ptr_score);
 
     // score factor
     @load_to_dsr(dest_dsr_1, score_dsd);
@@ -571,8 +612,13 @@ fn score_matvec_mult() void {
 }
 
 fn softmax_score() void {
-
+    var block_size: i16 = bsz * dim_p_pe;
+    var seq_len_local: u16 = @as(u16, cur_kv_offset / block_size); //seq_len_p_pe;
+    seq_len_p_pe_dsd_1 = @set_dsd_length(seq_len_p_pe_dsd_1, seq_len_local);
+    seq_len_p_pe_dsd_2 = @set_dsd_length(seq_len_p_pe_dsd_2, seq_len_local);
+    
     seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score);
+    
     @load_to_dsr(src1_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
     for (@range(i16, bsz)) |b| {
         max = 0.0;
@@ -618,7 +664,8 @@ fn output_matvec_mult() void {
 
     out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_output);
 
-    Kt = seq_len_p_pe;
+    var block_size: i16 = bsz * dim_p_pe;
+    Kt = cur_kv_offset / block_size; //seq_len_p_pe;
     Nt = dim_p_pe;
 
     vecmat_computation();
@@ -776,6 +823,8 @@ fn decode_struct() void {
     xq_rope();
     xk_rope();
 
+    process_kv();
+
     score_matvec_mult();
 
     comm_mod.reconfig_allreduce_axis(1);
@@ -809,6 +858,8 @@ fn decode_struct() void {
     ffn_residual_add();
 
     comm_mod.reconfig_allreduce_axis(1);
+
+    step += 1;
 
     decode_entry();
 }
@@ -901,8 +952,8 @@ comptime {
     @export_symbol(ptr_V_weight, "V_weight");
     @export_symbol(ptr_freqs_sin, "freqs_sin");
     @export_symbol(ptr_freqs_cos, "freqs_cos");
-    @export_symbol(ptr_XKCache, "XKCache");
-    @export_symbol(ptr_XVCache, "XVCache");
+    // @export_symbol(ptr_XKCache, "XKCache");
+    // @export_symbol(ptr_XVCache, "XVCache");
     @export_symbol(ptr_O_weight, "O_weight");
     @export_symbol(ptr_UP_weight, "UP_weight");
     @export_symbol(ptr_GATE_weight, "GATE_weight");
