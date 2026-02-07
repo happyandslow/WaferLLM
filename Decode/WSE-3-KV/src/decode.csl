@@ -557,7 +557,7 @@ fn xk_rope() void {
 
 
 
-fn memcpy(dest: *f16, src: *f16, size: u16) void {
+fn range_copy(dest: *f16, src: *f16, size: u16) void {
     var src_dsd = @get_dsd(mem1d_dsd, .{
         .base_address = src,  
         .extent = size,
@@ -574,8 +574,8 @@ fn memcpy(dest: *f16, src: *f16, size: u16) void {
 fn process_kv() void {
     var remain: i16 = step % P;
     if (py == remain){
-        memcpy(&XKCache_tile[cur_kv_offset], &QKV_tile[bsz * dim_p_pe], bsz * dim_p_pe);
-        memcpy(&XVCache_tile[cur_kv_offset], &QKV_tile[bsz * dim_p_pe * 2], bsz * dim_p_pe);
+        range_copy(&XKCache_tile[cur_kv_offset], &QKV_tile[bsz * dim_p_pe], bsz * dim_p_pe);
+        range_copy(&XVCache_tile[cur_kv_offset], &QKV_tile[bsz * dim_p_pe * 2], bsz * dim_p_pe);
         cur_kv_offset += bsz * dim_p_pe;
     }
 }
