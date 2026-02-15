@@ -64,9 +64,9 @@ cslc --arch=wse3 ./src/layout.csl --fabric-dims="$FABRIC_W","$FABRIC_H" --fabric
     --params=P:"$P",bsz:"$BSZ",dim_p_pe:"$dim_p_pe",pes_p_head:"$pes_p_head",pes_p_kv_head:"$pes_p_kv_head",head_dim_p_pe:"$head_dim_p_pe",max_seq_len_p_pe:"$max_seq_len_p_pe",ffn_dim_p_pe:"$ffn_dim_p_pe",pe_num_p_group:"$pe_num_p_group",root_1st_phase:"$root_1st_phase",root_2nd_phase:"$root_2nd_phase" \
     -o out --memcpy --channels 1
 
-# cs_python launch_sim.py --config $CONFIG
+cs_python launch_sim.py --config $CONFIG
 
-# rm -rf simfab_traces
-# rm -rf wio_flows_tmpdir.*
-# rm wsjob-*.json
-# rm run_meta.json
+rm -rf simfab_traces
+rm -rf wio_flows_tmpdir.*
+rm wsjob-*.json
+rm run_meta.json

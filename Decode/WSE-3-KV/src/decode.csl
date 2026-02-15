@@ -180,6 +180,8 @@ var dim_p_pe_dsd_2 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{dim_p_pe} -> du
 // var seq_len_p_pe_dsd_2 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe} -> dummy[i] });
 var seq_len_p_pe_dsd_1 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> dummy[i] });
 var seq_len_p_pe_dsd_2 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> dummy[i] });
+var iters_num_bsz_stride_dsd_1 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> dummy[i] });
+var iters_num_bsz_stride_dsd_2 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> dummy[i] });
 // var ffn_dim_p_pe_dsd_1 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{ffn_dim_p_pe} -> dummy[i] });
 // var ffn_dim_p_pe_dsd_2 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{ffn_dim_p_pe} -> dummy[i] });
 
@@ -193,6 +195,50 @@ fn vecmat_computation() void {
     
     for (@range(i16, bsz)) |b| {
         right_matrix_dsd = @set_dsd_base_addr(right_matrix_dsd, ptr_right_matrix);
+
+        @load_to_dsr(dest_dsr_1, out_vector_dsd, .{ .save_address = false });
+        @load_to_dsr(src0_dsr_1, out_vector_dsd, .{ .save_address = false });
+        @load_to_dsr(src1_dsr_1, right_matrix_dsd, .{ .save_address = true });
+
+        @map(gemv_static_step, left_vector_dsd); // MFU 2x4Kx4K-flops
+
+        left_vector_dsd = @increment_dsd_offset(left_vector_dsd, Kt, f16);
+        out_vector_dsd = @increment_dsd_offset(out_vector_dsd, Nt, f16);
+    }
+
+}
+
+
+fn gemv_static_step_print(cur: f16) void {
+    prt.print_string("gemv_static_step: ");
+    @fmach(dest_dsr_1, src0_dsr_1, src1_dsr_1, cur);
+}
+fn vecmat_computation_print() void {
+    left_vector_dsd = @set_dsd_length(left_vector_dsd, @bitcast(u16, Kt));
+    right_matrix_dsd = @set_dsd_length(right_matrix_dsd, @bitcast(u16, Nt));
+    out_vector_dsd = @set_dsd_length(out_vector_dsd, @bitcast(u16, Nt));
+    
+    for (@range(i16, bsz)) |b| {
+        right_matrix_dsd = @set_dsd_base_addr(right_matrix_dsd, ptr_right_matrix);
+
+        @load_to_dsr(dest_dsr_1, out_vector_dsd, .{ .save_address = false });
+        @load_to_dsr(src0_dsr_1, out_vector_dsd, .{ .save_address = false });
+        @load_to_dsr(src1_dsr_1, right_matrix_dsd, .{ .save_address = true });
+
+        @map(gemv_static_step_print, left_vector_dsd); // MFU 2x4Kx4K-flops
+
+        left_vector_dsd = @increment_dsd_offset(left_vector_dsd, Kt, f16);
+        out_vector_dsd = @increment_dsd_offset(out_vector_dsd, Nt, f16);
+    }
+
+}
+
+fn vecmat_computation_stride() void {
+    left_vector_dsd = @set_dsd_length(left_vector_dsd, @bitcast(u16, Kt));
+    right_matrix_dsd = @set_dsd_length(right_matrix_dsd, @bitcast(u16, Nt));
+    out_vector_dsd = @set_dsd_length(out_vector_dsd, @bitcast(u16, Nt));
+    
+    for (@range(i16, bsz)) |b| {
 
         @load_to_dsr(dest_dsr_1, out_vector_dsd, .{ .save_address = false });
         @load_to_dsr(src0_dsr_1, out_vector_dsd, .{ .save_address = false });
@@ -380,6 +426,49 @@ var Z_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &Z_tile, .extent = bsz * dim_
 var ptr_debug: [*]f16 = &X_tile;
 
 
+const prt = @import_module("<simprint>");
+
+fn simprint_pe_coords_val( curL : f16) void {
+  prt.print_string("PE : ");
+  prt.print_string("(");
+  prt.print_u16_decimal(@as(u16, px));
+  prt.print_string(",");
+  prt.print_u16_decimal(@as(u16, py));
+  prt.print_string(": ");
+  prt.print_f16(curL);
+  prt.print_string(" ");
+}
+
+fn simprint_pe_coords_dsd( dsd : mem1d_dsd) void {
+  prt.print_string("PE : ");
+  prt.print_string("(");
+  prt.print_u16_decimal(@as(u16, px));
+  prt.print_string(",");
+  prt.print_u16_decimal(@as(u16, py));
+  prt.print_string(":[");
+  @map(print_dsd_data, dsd);
+  prt.print_string("] ");
+}
+
+fn print_dsd_data(curL : f16) void {
+  prt.print_f16(curL);
+  prt.print_string(", ");
+}
+
+
+fn simprint_pe_coords(order: u16, curL : f16) void {
+  prt.print_string("PE order: ");
+  prt.print_u16_decimal(order);
+  prt.print_string("(");
+  prt.print_u16_decimal(@as(u16, px));
+  prt.print_string(",");
+  prt.print_u16_decimal(@as(u16, py));
+  prt.print_string(": ");
+  prt.print_f16(curL);
+  prt.print_string(") ");
+}
+
+
 // -------------------------------------------------------------------------- //
 // ------------------------------ Decode Funcs ------------------------------ //
 // -------------------------------------------------------------------------- //
@@ -417,13 +506,14 @@ fn rmsnorm_x() void {
 
 fn xq_matvec_mult() void {
     @fmovh(Q_dsd, 0.0);
-
-    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_X_norm);
+    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_X);
 
     ptr_right_matrix = &Q_weight_tile;
 
     // out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_Q);
     out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_QKV_tile);
+    // @map(simprint_pe_coords_val, left_vector_dsd);
+    // @map(simprint_pe_coords_val, out_vector_dsd);
 
     Kt = dim_p_pe;
     Nt = dim_p_pe;
@@ -436,7 +526,7 @@ fn xq_matvec_mult() void {
 fn xk_matvec_mult() void {
     @fmovh(K_dsd, 0.0);
 
-    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_X_norm);
+    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_X);
 
     ptr_right_matrix = &K_weight_tile;
 
@@ -455,7 +545,7 @@ fn xk_matvec_mult() void {
 fn xv_matvec_mult() void {
     @fmovh(V_dsd, 0.0);
 
-    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_X_norm);
+    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_X);
 
     ptr_right_matrix = &V_weight_tile;
 
@@ -567,110 +657,271 @@ fn range_copy(dest: *f16, src: *f16, size: u16) void {
         .base_address = dest, 
         .extent = size,
     });
+    
+    // prt.print_string("size: ");
+    // prt.print_u16_decimal(size);
 
-    @fmovs(dest_dsd, src_dsd);
+    // var src_dsd_tmp = @get_dsd(mem1d_dsd, .{
+    //     .base_address = src,  
+    //     .extent = size * 2,
+    // });
+
+    // var dest_dsd_tmp = @get_dsd(mem1d_dsd, .{
+    //     .base_address = dest, 
+    //     .extent = size * 2,
+    // });
+    // prt.print_string("PRE SRC: ");
+    // @map(simprint_pe_coords_val, src_dsd_tmp);
+    // prt.print_string("PRE TARGET: ");
+    // @map(simprint_pe_coords_val, dest_dsd_tmp);
+    @fmovh(dest_dsd, src_dsd);
+    // prt.print_string("POST SRC: ");
+    // @map(simprint_pe_coords_val, src_dsd_tmp);
+    // prt.print_string("POST TARGET: ");
+    // @map(simprint_pe_coords_val, dest_dsd_tmp);
 }
 
 fn process_kv() void {
     var remain: i16 = step % P;
     if (py == remain){
-        range_copy(&XKCache_tile[cur_kv_offset], &QKV_tile[bsz * dim_p_pe], bsz * dim_p_pe);
-        range_copy(&XVCache_tile[cur_kv_offset], &QKV_tile[bsz * dim_p_pe * 2], bsz * dim_p_pe);
+        range_copy(&XKCache_tile[cur_kv_offset], &QKV_tile[bsz * dim_p_pe], bsz * dim_p_pe );
+        range_copy(&XVCache_tile[cur_kv_offset], &QKV_tile[bsz * dim_p_pe * 2], bsz * dim_p_pe );
         cur_kv_offset += bsz * dim_p_pe;
     }
+
+    // var xk_dsd = @get_dsd(mem1d_dsd, .{
+    //     .base_address = &XKCache_tile,  
+    //     .extent = bsz * dim_p_pe * max_seq_len_p_pe,
+    // });
+    // @map(simprint_pe_coords_val, xk_dsd);
+
+
+    // var xv_dsd = @get_dsd(mem1d_dsd, .{
+    //     .base_address = &XVCache_tile,  
+    //     .extent = bsz * dim_p_pe * max_seq_len_p_pe,
+    // });
+    // @map(simprint_pe_coords_val, xv_dsd);
 }
 
 
-fn score_matvec_mult() void {
-    Kt = dim_p_pe;
+fn score_matvec_mult() void { 
     var block_size: i16 = bsz * dim_p_pe;
-    Nt = cur_kv_offset / block_size; //seq_len_p_pe;
+    var iters_num: i16 = @as(i16, cur_kv_offset / block_size);
 
-    score_dsd = @set_dsd_length(score_dsd, @as(u16, bsz * Nt));
-    score_tmp_dsd = @set_dsd_length(score_tmp_dsd, @as(u16, bsz * Nt));
-
-    @fmovh(score_dsd, 0.0);
-
-    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_QKV_tile);
-    
-    ptr_right_matrix = &XKCache_tile;
-
+    right_matrix_dsd = @set_dsd_base_addr(right_matrix_dsd, &XKCache_tile);
     out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_score);
 
-    // Kt = dim_p_pe;
-    // var block_size: i16 = bsz * dim_p_pe;
-    // Nt = cur_kv_offset / block_size; //seq_len_p_pe;
+    score_dsd = @set_dsd_length(score_dsd, @as(u16, bsz * iters_num));
+    @fmovh(score_dsd, 0.0);
 
-    vecmat_computation();
 
-    comm_mod.all_reduce_bsz_seq_len(px, quotient_x, remainder_x, Nt, ptr_score);
-
+    for (@range(i16, iters_num)) |i| {
+        Kt = dim_p_pe;
+        Nt = 1; //seq_len_p_pe;
+        left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_QKV_tile);
+        left_vector_dsd = @set_dsd_length(left_vector_dsd, @bitcast(u16, Kt));
+        right_matrix_dsd = @set_dsd_length(right_matrix_dsd, @bitcast(u16, Nt));
+        out_vector_dsd = @set_dsd_length(out_vector_dsd, @bitcast(u16, Nt));
+        // prt.print_string("left vector dsd: ");
+        // simprint_pe_coords_dsd(left_vector_dsd);
+        // prt.print_string("right matrix dsd: ");
+        // simprint_pe_coords_dsd(right_matrix_dsd);
+        for (@range(i16, bsz)) |b| {
+            @load_to_dsr(dest_dsr_1, out_vector_dsd, .{ .save_address = false });
+            @load_to_dsr(src0_dsr_1, out_vector_dsd, .{ .save_address = false });
+            @load_to_dsr(src1_dsr_1, right_matrix_dsd, .{ .save_address = true });
+            @map(gemv_static_step, left_vector_dsd); // MFU 2x4Kx4K-flops
+            left_vector_dsd = @increment_dsd_offset(left_vector_dsd, Kt, f16);
+            out_vector_dsd = @increment_dsd_offset(out_vector_dsd, Nt, f16);
+            right_matrix_dsd = @increment_dsd_offset(right_matrix_dsd, Kt, f16);
+        }
+        // left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_QKV_tile);
+        // vecmat_computation_stride();
+        // prt.print_string("out vector dsd: (length ");
+        // prt.print_u16_decimal(@as(u16, bsz * iters_num));
+        // prt.print_string(") ");
+        // simprint_pe_coords_dsd(score_dsd);
+        // out_vector_dsd = @increment_dsd_offset(out_vector_dsd, bsz, f16);
+        // right_matrix_dsd = @increment_dsd_offset(right_matrix_dsd, bsz * dim_p_pe, f16);
+    }
+    
+    // prt.print_string(" score dsd pre reduce ");
+    // simprint_pe_coords_dsd(score_dsd);
+    comm_mod.all_reduce_bsz_seq_len(px, quotient_x, remainder_x, bsz * iters_num, ptr_score);
+    // prt.print_string(" score dsd post reduce ");
+    // simprint_pe_coords_dsd(score_dsd);
+    
     // score factor
     @load_to_dsr(dest_dsr_1, score_dsd);
     @load_to_dsr(src0_dsr_1, score_dsd);
     @fmulh(dest_dsr_1, src0_dsr_1, alpha);
+    // prt.print_string(" score dsd post reduce 1 ");
+    // @map(simprint_pe_coords_val, score_dsd);
 }
+
+
+
+
 
 fn softmax_score() void {
     var block_size: i16 = bsz * dim_p_pe;
-    var seq_len_local: u16 = @as(u16, cur_kv_offset / block_size); //seq_len_p_pe;
-    seq_len_p_pe_dsd_1 = @set_dsd_length(seq_len_p_pe_dsd_1, seq_len_local);
-    seq_len_p_pe_dsd_2 = @set_dsd_length(seq_len_p_pe_dsd_2, seq_len_local);
+    var iters_num: i16 = @as(i16, cur_kv_offset / block_size); //seq_len_p_pe;
+    iters_num_bsz_stride_dsd_1 = @set_dsd_base_addr(iters_num_bsz_stride_dsd_1, ptr_score);
+    iters_num_bsz_stride_dsd_1 = @set_dsd_stride(iters_num_bsz_stride_dsd_1, bsz);
+    iters_num_bsz_stride_dsd_1 = @set_dsd_length(iters_num_bsz_stride_dsd_1, @as(u16, iters_num));
+    iters_num_bsz_stride_dsd_2 = @set_dsd_stride(iters_num_bsz_stride_dsd_2, bsz);
+    iters_num_bsz_stride_dsd_2 = @set_dsd_length(iters_num_bsz_stride_dsd_2, @as(u16, iters_num));
     
-    seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score);
-    
-    @load_to_dsr(src1_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
+    // @load_to_dsr(src1_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
     for (@range(i16, bsz)) |b| {
+        @load_to_dsr(src1_dsr_1, iters_num_bsz_stride_dsd_1, .{ .save_address = false });
         max = 0.0;
         @fmaxh(ptr_max, max, src1_dsr_1);
         local_max[b] = max;
+        
+        iters_num_bsz_stride_dsd_1 = @increment_dsd_offset(iters_num_bsz_stride_dsd_1, 1, f16);
     }
-
+    
+    
+    
     comm_mod.all_reduceMax_bsz(py, quotient_y, remainder_y, ptr_local_max);
+    // prt.print_string(" local max pre sub ");
+    // for (@range(i16, bsz)) |b| {
+    //     prt.print_f16(local_max[b]);
+    // }
 
-    seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score_tmp);
-    seq_len_p_pe_dsd_2 = @set_dsd_base_addr(seq_len_p_pe_dsd_2, ptr_score);
-    @load_to_dsr(dest_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
-    @load_to_dsr(src0_dsr_1, seq_len_p_pe_dsd_2, .{ .save_address = true });
-    @map(fsubh_func, local_max_dsd);
-
+    // seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score_tmp);
+    // seq_len_p_pe_dsd_2 = @set_dsd_base_addr(seq_len_p_pe_dsd_2, ptr_score);
+    // @load_to_dsr(dest_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
+    // @load_to_dsr(src0_dsr_1, seq_len_p_pe_dsd_2, .{ .save_address = true });
+    // @map(fsubh_func, local_max_dsd);
+    // @map(fast_exp, score_tmp_dsd, score_dsd);
+    score_dsd = @set_dsd_length(score_dsd, @as(u16, bsz * iters_num));
+    score_tmp_dsd = @set_dsd_length(score_tmp_dsd, @as(u16, bsz * iters_num));
+    iters_num_bsz_stride_dsd_1 = @set_dsd_base_addr(iters_num_bsz_stride_dsd_1, ptr_score);
+    iters_num_bsz_stride_dsd_2 = @set_dsd_base_addr(iters_num_bsz_stride_dsd_2, ptr_score_tmp);
+    local_max_dsd = @set_dsd_length(local_max_dsd, @as(u16, 1));
+    for (@range(i16, bsz)) |b| {
+        @load_to_dsr(dest_dsr_1, iters_num_bsz_stride_dsd_1, .{ .save_address = true });
+        @load_to_dsr(src0_dsr_1, iters_num_bsz_stride_dsd_2, .{ .save_address = true });
+        @map(fsubh_func, local_max_dsd);
+        iters_num_bsz_stride_dsd_1 = @increment_dsd_offset(iters_num_bsz_stride_dsd_1, 1, f16);
+        iters_num_bsz_stride_dsd_2 = @increment_dsd_offset(iters_num_bsz_stride_dsd_2, 1, f16);
+        local_max_dsd = @increment_dsd_offset(local_max_dsd, 1, f16);
+    }
     @map(fast_exp, score_tmp_dsd, score_dsd);
+
+    // prt.print_string(" local max post sub");
+    // for (@range(i16, bsz)) |b| {
+    //     prt.print_f16(local_max[b]);
+    // }
+
+    
+
+    // prt.print_string(" score dsd post softmax 3 ");
+    // @map(simprint_pe_coords_val, score_dsd);
     // for (@range(i16, bsz*seq_len_p_pe)) |i| {
     //     score[i] = fast_exp(score_tmp[i]);
     // }
 
-    seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score);
-    @load_to_dsr(src1_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
+    // seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score);
+    // @load_to_dsr(src1_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
+    // prt.print_string(" ptr_score ");
+    // for (@range(i16, bsz * max_seq_len_p_pe)) |i| {
+    //     prt.print_f16(score[i]);
+    //     prt.print_string(",");
+    // }
+
+    iters_num_bsz_stride_dsd_1 = @set_dsd_base_addr(iters_num_bsz_stride_dsd_1, ptr_score);
     for (@range(i16, bsz)) |b| {
+        // prt.print_string("iters_num_bsz_stride_dsd_1:");
+        // simprint_pe_coords_dsd(iters_num_bsz_stride_dsd_1);
         sum = 0.0;
-        @faddh(ptr_sum, sum, src1_dsr_1);
+        // for (@range(i16, iters_num)) |j| {
+            @load_to_dsr(src1_dsr_1, iters_num_bsz_stride_dsd_1, .{ .save_address = true });
+            // prt.print_string(" iterating sum: iters_num_bsz_stride_dsd_1:");
+            // @map(simprint_pe_coords_val, iters_num_bsz_stride_dsd_1);
+            @faddh(ptr_sum, sum, src1_dsr_1);
+        // }
+        
+        
+        
         local_sum[b] = sum;
+        iters_num_bsz_stride_dsd_1 = @increment_dsd_offset(iters_num_bsz_stride_dsd_1, 1, f16);
+    }
+    // prt.print_string(" local sum pre reduce ");
+    // for (@range(i16, bsz)) |b| {
+    //     prt.print_f16(local_sum[b]);
+    //     prt.print_string(",");
+    // }
+    comm_mod.all_reduce_bsz(py, quotient_y, remainder_y, ptr_local_sum);
+    // prt.print_string(" local sum post reduce ");
+    // for (@range(i16, bsz)) |b| {
+    //     prt.print_f16(local_sum[b]);
+    // }
+    // seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score);
+    // @load_to_dsr(dest_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
+    // @load_to_dsr(src0_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
+    // @map(fmulh_softmax_func, local_sum_dsd);
+    iters_num_bsz_stride_dsd_1 = @set_dsd_base_addr(iters_num_bsz_stride_dsd_1, ptr_score);
+    local_sum_dsd = @set_dsd_base_addr(local_sum_dsd, ptr_local_sum);
+    local_sum_dsd = @set_dsd_length(local_sum_dsd, @as(u16, 1));
+    for (@range(i16, bsz)) |b| {
+        // prt.print_string(" iters_num_bsz_stride_dsd_1: ");
+        // simprint_pe_coords_dsd(iters_num_bsz_stride_dsd_1);
+        // prt.print_string(" local_sum_dsd: ");
+        // simprint_pe_coords_dsd(local_sum_dsd);
+
+        @load_to_dsr(dest_dsr_1, iters_num_bsz_stride_dsd_1, .{ .save_address = false });
+        @load_to_dsr(src0_dsr_1, iters_num_bsz_stride_dsd_1, .{ .save_address = false });
+
+        @map(fmulh_softmax_func, local_sum_dsd);
+        local_sum_dsd = @increment_dsd_offset(local_sum_dsd, 1, f16);
+        iters_num_bsz_stride_dsd_1 = @increment_dsd_offset(iters_num_bsz_stride_dsd_1, 1, f16);
     }
 
-    comm_mod.all_reduce_bsz(py, quotient_y, remainder_y, ptr_local_sum);
+    score_dsd = @set_dsd_base_addr(score_dsd, ptr_score);
+    score_dsd = @set_dsd_length(score_dsd, @as(u16, bsz * iters_num));
+    // prt.print_string(" score_dsd: ");
+    // simprint_pe_coords_dsd(score_dsd);
 
-    seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score);
-    @load_to_dsr(dest_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
-    @load_to_dsr(src0_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
-    @map(fmulh_softmax_func, local_sum_dsd);
 }
 
 fn output_matvec_mult() void {
     @fmovh(output_dsd, 0.0);
-
-    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_score);
-    
-    ptr_right_matrix = &XVCache_tile;
-
-    out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_output);
-
     var block_size: i16 = bsz * dim_p_pe;
-    Kt = cur_kv_offset / block_size; //seq_len_p_pe;
+    var iters_num: u16 = @as(u16, cur_kv_offset / block_size);
+    Kt = 1; // / block_size; //seq_len_p_pe;
     Nt = dim_p_pe;
 
-    vecmat_computation();
-
+    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_score);
+    right_matrix_dsd = @set_dsd_base_addr(right_matrix_dsd, &XVCache_tile);
+    out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_output);
+    out_vector_dsd = @set_dsd_length(out_vector_dsd, @bitcast(u16, Nt));
+    for (@range(i16, @as(i16, iters_num))) |i| {
+        // prt.print_string(" left vector dsd ");
+        // simprint_pe_coords_dsd(left_vector_dsd);
+        // prt.print_string(" right matrix dsd ");
+        // simprint_pe_coords_dsd(right_matrix_dsd);
+        out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_output);
+        // out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_output);
+        vecmat_computation_stride();
+        // left_vector_dsd = @increment_dsd_offset(left_vector_dsd, bsz, f16);
+        right_matrix_dsd = @increment_dsd_offset(right_matrix_dsd, bsz * dim_p_pe, f16);
+    }
+    // prt.print_string(" output dsd post matvec mult ");
+    // simprint_pe_coords_dsd(out_vector_dsd);
+    // output_dsd = @set_dsd_length(output_dsd, @bitcast(u16, bsz * dim_p_pe));
+    // output_dsd = @set_dsd_base_addr(output_dsd, &output_tile);
+    // out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_output);
+    // prt.print_string(" ptr output vector dsd pre all reduce ");
+    // @map(simprint_pe_coords_val, out_vector_dsd);
+    // @fmovh(out_vector_dsd, 1.0);
+    // @fmovh(output_dsd, 1.0);
     comm_mod.all_reduce_bsz_dim(py, quotient_y, remainder_y, ptr_output);
+    // prt.print_string(" ptr output vector dsd post all reduce ");
+    // @map(simprint_pe_coords_val, out_vector_dsd);
+    
 }
 
 fn o_matvec_mult() void {
@@ -820,8 +1071,8 @@ fn decode_struct() void {
 
     comm_mod.reconfig_allreduce_axis(0); // 0: px row-wise, 1: py col-wise
 
-    xq_rope();
-    xk_rope();
+    // xq_rope();
+    // xk_rope();
 
     process_kv();
 
@@ -860,6 +1111,12 @@ fn decode_struct() void {
     comm_mod.reconfig_allreduce_axis(1);
 
     step += 1;
+
+    // var xk_dsd = @get_dsd(mem1d_dsd, .{
+    //     .base_address = &XKCache_tile,  
+    //     .extent = bsz * dim_p_pe * max_seq_len_p_pe,
+    // });
+    // @map(simprint_pe_coords_val, xk_dsd);
 
     decode_entry();
 }
@@ -950,10 +1207,13 @@ comptime {
     @export_symbol(ptr_Q_weight, "Q_weight");
     @export_symbol(ptr_K_weight, "K_weight");
     @export_symbol(ptr_V_weight, "V_weight");
+    @export_symbol(ptr_output, "output");
+    @export_symbol(ptr_score, "score");
     @export_symbol(ptr_freqs_sin, "freqs_sin");
     @export_symbol(ptr_freqs_cos, "freqs_cos");
-    // @export_symbol(ptr_XKCache, "XKCache");
-    // @export_symbol(ptr_XVCache, "XVCache");
+    @export_symbol(ptr_QKV_tile, "QKV_tile");
+    @export_symbol(ptr_XKCache, "XKCache");
+    @export_symbol(ptr_XVCache, "XVCache");
     @export_symbol(ptr_O_weight, "O_weight");
     @export_symbol(ptr_UP_weight, "UP_weight");
     @export_symbol(ptr_GATE_weight, "GATE_weight");

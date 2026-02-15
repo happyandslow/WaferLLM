@@ -821,17 +821,39 @@ fn all_reduce_bsz_dim_QKV_fusion(pe_id: i16, quotient_pe_id: i16, remainder_pe_i
     }
 }
 
+const layout_mod = @import_module("<layout>");
+
+fn simprint_pe_coords_val( curL : f16) void {
+  var px: i16 = 0;
+  var py: i16 = 0;
+  px = @as(i16, layout_mod.get_x_coord());
+  py = @as(i16, layout_mod.get_y_coord());
+  prt.print_string("PE : ");
+  prt.print_string("(");
+  prt.print_u16_decimal(@as(u16, px));
+  prt.print_string(",");
+  prt.print_u16_decimal(@as(u16, py));
+  prt.print_string(": ");
+  prt.print_f16(curL);
+  prt.print_string(" ");
+}
+
 fn all_reduce_bsz_seq_len(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16, seq_len_local: i16, vector_buf_ptr: [*]f16) void {
     // var vector_buf_dsd_bsz_seq_len = @get_dsd(mem1d_dsd, .{ .base_address = &dummy, .extent = bsz * seq_len_p_pe });
-    vector_buf_dsd_bsz_seq_len = @get_dsd(mem1d_dsd, .{ .base_address = vector_buf_ptr, .extent = @as(u16, bsz * seq_len_local) });
-    var var_reduce_1st_0_recv_bsz_seq_len = @set_dsd_length(reduce_1st_0_recv_bsz_seq_len, @as(u16, bsz * seq_len_local));
-    var var_reduce_1st_1_recv_bsz_seq_len = @set_dsd_length(reduce_1st_1_recv_bsz_seq_len, @as(u16, bsz * seq_len_local));
-    var var_reduce_2nd_0_recv_bsz_seq_len = @set_dsd_length(reduce_2nd_0_recv_bsz_seq_len, @as(u16, bsz * seq_len_local));
-    var var_reduce_2nd_1_recv_bsz_seq_len = @set_dsd_length(reduce_2nd_1_recv_bsz_seq_len, @as(u16, bsz * seq_len_local));
-    var var_reduce_1st_0_send_bsz_seq_len = @set_dsd_length(reduce_1st_0_send_bsz_seq_len, @as(u16, bsz * seq_len_local));
-    var var_reduce_1st_1_send_bsz_seq_len = @set_dsd_length(reduce_1st_1_send_bsz_seq_len, @as(u16, bsz * seq_len_local));
-    var var_reduce_2nd_0_send_bsz_seq_len = @set_dsd_length(reduce_2nd_0_send_bsz_seq_len, @as(u16, bsz * seq_len_local));
-    var var_reduce_2nd_1_send_bsz_seq_len = @set_dsd_length(reduce_2nd_1_send_bsz_seq_len, @as(u16, bsz * seq_len_local));
+    // simprint.print_string("all_reduce_bsz_seq_len: ");
+    // simprint.print_u16_decimal(@as(u16, bsz * seq_len_local));
+    // simprint.print_string(" seq_len_local: ");
+    // simprint.print_u16_decimal(@as(u16, seq_len_local));
+    vector_buf_dsd_bsz_seq_len = @get_dsd(mem1d_dsd, .{ .base_address = vector_buf_ptr, .extent = @as(u16, seq_len_local) });
+    var var_reduce_1st_0_recv_bsz_seq_len = @set_dsd_length(reduce_1st_0_recv_bsz_seq_len, @as(u16,seq_len_local));
+    var var_reduce_1st_1_recv_bsz_seq_len = @set_dsd_length(reduce_1st_1_recv_bsz_seq_len, @as(u16, seq_len_local));
+    var var_reduce_2nd_0_recv_bsz_seq_len = @set_dsd_length(reduce_2nd_0_recv_bsz_seq_len, @as(u16, seq_len_local));
+    var var_reduce_2nd_1_recv_bsz_seq_len = @set_dsd_length(reduce_2nd_1_recv_bsz_seq_len, @as(u16, seq_len_local));
+    var var_reduce_1st_0_send_bsz_seq_len = @set_dsd_length(reduce_1st_0_send_bsz_seq_len, @as(u16, seq_len_local));
+    var var_reduce_1st_1_send_bsz_seq_len = @set_dsd_length(reduce_1st_1_send_bsz_seq_len, @as(u16, seq_len_local));
+    var var_reduce_2nd_0_send_bsz_seq_len = @set_dsd_length(reduce_2nd_0_send_bsz_seq_len, @as(u16, seq_len_local));
+    var var_reduce_2nd_1_send_bsz_seq_len = @set_dsd_length(reduce_2nd_1_send_bsz_seq_len, @as(u16, seq_len_local));
+    var var_bdcast_recv_bsz_seq_len = @set_dsd_length(bdcast_recv_bsz_seq_len, @as(u16, seq_len_local));
 
     @load_to_dsr(vector_buf_dsr, vector_buf_dsd_bsz_seq_len);
 
@@ -845,13 +867,16 @@ fn all_reduce_bsz_seq_len(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16,
         if (remainder_pe_id % 2 == 0) {
             if (remainder_pe_id == pe_num_p_group - 1) {
                 @fmovh(var_reduce_1st_0_send_bsz_seq_len, vector_buf_dsr);
+                // @map(simprint_pe_coords_val, var_reduce_1st_0_send_bsz_seq_len);
             } else {
+                
                 @faddh(var_reduce_1st_0_send_bsz_seq_len, var_reduce_1st_1_recv_bsz_seq_len, vector_buf_dsr);
             }
         } else {
             // remainder_pe_id % 2 == 1
             if (remainder_pe_id == pe_num_p_group - 1) {
                 @fmovh(var_reduce_1st_1_send_bsz_seq_len, vector_buf_dsr);
+                // @map(simprint_pe_coords_val, var_reduce_1st_0_send_bsz_seq_len);
             } else {
                 @faddh(var_reduce_1st_1_send_bsz_seq_len, var_reduce_1st_0_recv_bsz_seq_len, vector_buf_dsr);
             }
@@ -861,6 +886,7 @@ fn all_reduce_bsz_seq_len(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16,
         if (remainder_pe_id % 2 == 0) {
             if (remainder_pe_id == 0) {
                 @fmovh(var_reduce_1st_1_send_bsz_seq_len, vector_buf_dsr);
+                // @map(simprint_pe_coords_val, var_reduce_1st_0_send_bsz_seq_len);
             } else {
                 @faddh(var_reduce_1st_1_send_bsz_seq_len, var_reduce_1st_0_recv_bsz_seq_len, vector_buf_dsr);
             }
@@ -908,9 +934,9 @@ fn all_reduce_bsz_seq_len(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16,
 
     // Broadcast
     if (pe_id == root_2nd_phase) {
-        @mov16(bdcast_send_bsz_seq_len, vector_buf_dsr);
+        @mov16(var_bdcast_recv_bsz_seq_len, vector_buf_dsr);
     } else {
-        @mov16(vector_buf_dsd_bsz_seq_len, bdcast_recv_bsz_seq_len);
+        @mov16(vector_buf_dsd_bsz_seq_len, var_bdcast_recv_bsz_seq_len);
     }
 }
 

@@ -96,10 +96,13 @@ layout {
     @export_name("Q_weight", [*]f16, true);
     @export_name("K_weight", [*]f16, true);
     @export_name("V_weight", [*]f16, true);
+    @export_name("output", [*]f16, true);
+    @export_name("score", [*]f16, true);
     @export_name("freqs_sin", [*]f16, true);
     @export_name("freqs_cos", [*]f16, true);
-    // @export_name("XKCache", [*]f16, true);
-    // @export_name("XVCache", [*]f16, true);
+    @export_name("XKCache", [*]f16, true);
+    @export_name("XVCache", [*]f16, true);
+    @export_name("QKV_tile", [*]f16, true);
     @export_name("O_weight", [*]f16, true);
     @export_name("UP_weight", [*]f16, true);
     @export_name("GATE_weight", [*]f16, true);

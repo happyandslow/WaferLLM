@@ -67,14 +67,24 @@ def main():
     memcpy_order = MemcpyOrder.ROW_MAJOR
 
     X = np.random.rand(1, bsz*dim).astype(np.float16)
+    X.fill(1.0)
     tensor_X = np.tile(X.reshape(P, bsz*dim_p_pe), reps=(1, P))
     
+    print(f"Original X: {X}")
+    print(f"tensor_X: {tensor_X}")
+    
     W = np.random.rand(1, dim).astype(np.float16)
+    W.fill(1.0)
     tensor_W = np.tile(W.reshape(P, dim_p_pe), reps=(1, P))
+    
     
     tensor_q_weight = np.random.rand(dim, dim).astype(np.float16)
     tensor_k_weight = np.random.rand(dim, dim).astype(np.float16)
     tensor_v_weight = np.random.rand(dim, dim).astype(np.float16)
+
+    tensor_q_weight.fill(1.0)
+    tensor_k_weight.fill(2.0)
+    tensor_v_weight.fill(3.0)
     
     _dim_p_pe = dim_p_pe
     if (dim_p_pe % 2) == 1:
@@ -121,7 +131,11 @@ def main():
     symbol_timer_buf = runner.get_id("timer_buf")
     symbol_timer_ref = runner.get_id("time_ref")
     sym_debug = runner.get_id("debug")
-    
+    sym_score = runner.get_id("score")
+    sym_output = runner.get_id("output")
+    sym_QKV_tile = runner.get_id("QKV_tile")
+    sym_XKCache = runner.get_id("XKCache")
+    sym_XVCache = runner.get_id("XVCache")
     
     # -------------------------------------------------------------------------- #
     # ------------------------------ H2D memcpy ------------------------------ #
@@ -227,7 +241,7 @@ def main():
     # -------------------------------------------------------------------------- #
     runner.launch("init_task", nonblock=False)
     
-    repeat_steps = 1
+    repeat_steps = 13
     warmup_steps = 0
     runner.launch("decode_host", np.int16(repeat_steps), np.int16(warmup_steps), nonblock=False)
     
@@ -241,6 +255,41 @@ def main():
     )
     debug = memcpy_view(debug_1d_u32, np.dtype(np.float16))
     debug = debug.reshape(P, bsz * dim)
+    
+    score_1d_u32 = np.zeros(P * bsz * max_seq_len, dtype=np.uint32)
+    runner.memcpy_d2h(
+        score_1d_u32, sym_score, 0, 0, P, P, bsz * max_seq_len_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
+    )
+    intermediate_score = memcpy_view(score_1d_u32, np.dtype(np.float16))
+    intermediate_score = intermediate_score.reshape(P, bsz * max_seq_len)
+    
+    output_1d_u32 = np.zeros(P * bsz * dim, dtype=np.uint32)
+    runner.memcpy_d2h(
+        output_1d_u32, sym_output, 0, 0, P, P, bsz * dim_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
+    )
+    intermediate_result = memcpy_view(output_1d_u32, np.dtype(np.float16))
+    intermediate_result = intermediate_result.reshape(P, bsz * dim)
+    
+    xqkv_1d_u32 = np.zeros(P * bsz * dim * 3, dtype=np.uint32)
+    runner.memcpy_d2h(
+        xqkv_1d_u32, sym_QKV_tile, 0, 0, P, P, bsz * dim_p_pe * 3, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
+    )
+    xqkv_result = memcpy_view(xqkv_1d_u32, np.dtype(np.float16))
+    xqkv_result = xqkv_result.reshape(P, bsz * dim * 3)
+    
+    xkcache_1d_u32 = np.zeros(P * bsz * dim * max_seq_len_p_pe, dtype=np.uint32)
+    runner.memcpy_d2h(
+        xkcache_1d_u32, sym_XKCache, 0, 0, P, P, bsz * dim_p_pe * max_seq_len_p_pe , streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
+    )
+    xkcache_result = memcpy_view(xkcache_1d_u32, np.dtype(np.float16))
+    xkcache_result = xkcache_result.reshape(P, bsz * dim * max_seq_len_p_pe )
+    
+    xvcache_1d_u32 = np.zeros(P * bsz * dim * max_seq_len_p_pe, dtype=np.uint32)
+    runner.memcpy_d2h(
+        xvcache_1d_u32, sym_XVCache, 0, 0, P, P, bsz * dim_p_pe * max_seq_len_p_pe , streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
+    )
+    xvcache_result = memcpy_view(xvcache_1d_u32, np.dtype(np.float16))
+    xvcache_result = xvcache_result.reshape(P, bsz * dim * max_seq_len_p_pe )
     
     # -------------------------------------------------------------------------- #
     # ------------------------------ Timer Check ------------------------------ #
@@ -262,6 +311,30 @@ def main():
     print(X)
     print("Simulated Result:")
     print(debug)
+    
+    
+    Xq = np.matmul(X.reshape(bsz, dim), tensor_q_weight)
+    Xk = np.matmul(X.reshape(bsz, dim), tensor_k_weight)
+    Xv = np.matmul(X.reshape(bsz, dim), tensor_v_weight)
+    # print(f"tensor_q_weight: \n{tensor_q_weight}")
+    
+    # Set NumPy print options to show entire arrays without truncation
+    # np.set_printoptions(threshold=np.inf, edgeitems=10, linewidth=np.inf)
+    
+    print(f"Xq: \n{Xq}")
+    print(f"Xk: \n{Xk}")
+    print(f"Xv: \n{Xv}")
+    print(f"Xqkv Result: \n{xqkv_result}")
+
+    print(f"Xkcache Result: \n{xkcache_result}")
+    print(f"Xvcache Result: \n{xvcache_result}")
+    
+    
+    print(f"Intermediate Score:\n {intermediate_score}")
+    print(f"Intermediate Result:\n {intermediate_result}")
+    
+    
+    
     
     debug_mod = debug_util("out")
     core_offset_x = 4
