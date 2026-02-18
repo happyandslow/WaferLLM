@@ -22,7 +22,7 @@ class Config:
         self.n_heads = 1
         self.n_kv_heads = 1
         self.head_dim = 64
-        self.seq_len = 64
+        self.max_seq_len = 64
         self.ffn_dim = 64
         self.layer_num = 32
 
@@ -50,14 +50,14 @@ def main():
     n_heads = config.n_heads
     n_kv_heads = config.n_kv_heads
     head_dim = config.head_dim
-    seq_len = config.seq_len
+    max_seq_len = config.max_seq_len
     ffn_dim = config.ffn_dim
     layer_num = config.layer_num
     dim_p_pe = dim // P
     pes_p_head = P // n_heads
     pes_p_kv_head = P // n_kv_heads
     head_dim_p_pe = head_dim // P
-    seq_len_p_pe = seq_len // P
+    max_seq_len_p_pe = max_seq_len // P
     ffn_dim_p_pe = ffn_dim // P
 
     print(f"Host: P: {P}, Batch size: {bsz}, dim_p_pe: {dim_p_pe}, pes_p_head: {pes_p_head}, pes_p_kv_head: {pes_p_kv_head}, head_dim_p_pe: {head_dim_p_pe}, ffn_dim_p_pe: {ffn_dim_p_pe}, simulator: {args.simulator}")
@@ -84,8 +84,8 @@ def main():
     freqs_cos = np.random.rand(1, P*_dim_p_pe//2).astype(np.float16)
     tensor_freqs_cos = np.tile(freqs_cos.reshape(P, _dim_p_pe//2), reps=(1, P))
     
-    tensor_XKCache = np.random.rand(dim, seq_len).astype(np.float16)
-    tensor_XVCache = np.random.rand(seq_len, dim).astype(np.float16)
+    # tensor_XKCache = np.random.rand(dim, max_seq_len).astype(np.float16)
+    # tensor_XVCache = np.random.rand(max_seq_len, dim).astype(np.float16)
     
     tensor_o_weight = np.random.rand(dim, dim).astype(np.float16)
     tensor_up_weight = np.random.rand(dim, ffn_dim).astype(np.float16)
@@ -109,8 +109,8 @@ def main():
         sym_V_weight = runner.get_id("V_weight")
         sym_freqs_sin = runner.get_id("freqs_sin")
         sym_freqs_cos = runner.get_id("freqs_cos")
-        sym_XKCache = runner.get_id("XKCache")
-        sym_XVCache = runner.get_id("XVCache")
+        # sym_XKCache = runner.get_id("XKCache")
+        # sym_XVCache = runner.get_id("XVCache")
         sym_O_weight = runner.get_id("O_weight")
         sym_UP_weight = runner.get_id("UP_weight")
         sym_GATE_weight = runner.get_id("GATE_weight")
@@ -178,24 +178,24 @@ def main():
         runner.memcpy_h2d(
             sym_freqs_cos, freqs_cos_u32, 0, 0, P, P, _dim_p_pe//2, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
         )
-        # Copy XKCache
-        XKCache_reshape = tensor_XKCache.reshape(P, dim_p_pe, P, seq_len_p_pe)
-        XKCache_transpose = XKCache_reshape.transpose(0, 2, 1, 3)
-        XKCache_reshape = XKCache_transpose.reshape(P, P, dim_p_pe * seq_len_p_pe)
-        # XKCache_u32 = sdk_utils.input_array_to_u32(XKCache_reshape.ravel(), 1, 1)
-        XKCache_u32 = cast_tensor_u32(XKCache_reshape.ravel())
-        runner.memcpy_h2d(
-            sym_XKCache, XKCache_u32, 0, 0, P, P, dim_p_pe * seq_len_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
-        )
-        # Copy XVCache
-        XVCache_reshape = tensor_XVCache.reshape(P, seq_len_p_pe, P, dim_p_pe)
-        XVCache_transpose = XVCache_reshape.transpose(0, 2, 1, 3)
-        XVCache_reshape = XVCache_transpose.reshape(P, P, seq_len_p_pe * dim_p_pe)
-        # XVCache_u32 = sdk_utils.input_array_to_u32(XVCache_reshape.ravel(), 1, 1)
-        XVCache_u32 = cast_tensor_u32(XVCache_reshape.ravel())
-        runner.memcpy_h2d(
-            sym_XVCache, XVCache_u32, 0, 0, P, P, seq_len_p_pe * dim_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
-        )
+        # # Copy XKCache
+        # XKCache_reshape = tensor_XKCache.reshape(P, dim_p_pe, P, seq_len_p_pe)
+        # XKCache_transpose = XKCache_reshape.transpose(0, 2, 1, 3)
+        # XKCache_reshape = XKCache_transpose.reshape(P, P, dim_p_pe * seq_len_p_pe)
+        # # XKCache_u32 = sdk_utils.input_array_to_u32(XKCache_reshape.ravel(), 1, 1)
+        # XKCache_u32 = cast_tensor_u32(XKCache_reshape.ravel())
+        # runner.memcpy_h2d(
+        #     sym_XKCache, XKCache_u32, 0, 0, P, P, dim_p_pe * seq_len_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
+        # )
+        # # Copy XVCache
+        # XVCache_reshape = tensor_XVCache.reshape(P, seq_len_p_pe, P, dim_p_pe)
+        # XVCache_transpose = XVCache_reshape.transpose(0, 2, 1, 3)
+        # XVCache_reshape = XVCache_transpose.reshape(P, P, seq_len_p_pe * dim_p_pe)
+        # # XVCache_u32 = sdk_utils.input_array_to_u32(XVCache_reshape.ravel(), 1, 1)
+        # XVCache_u32 = cast_tensor_u32(XVCache_reshape.ravel())
+        # runner.memcpy_h2d(
+        #     sym_XVCache, XVCache_u32, 0, 0, P, P, seq_len_p_pe * dim_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
+        # )
         # Copy O_weight
         O_reshape = tensor_o_weight.reshape(P, dim_p_pe, P, dim_p_pe)
         O_transpose = O_reshape.transpose(0, 2, 1, 3)

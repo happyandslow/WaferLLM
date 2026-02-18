@@ -6,6 +6,6 @@
     "n_heads": 1,
     "n_kv_heads": 1,
     "head_dim": 16,
-    "seq_len": 16,
+    "max_seq_len": 16,
     "ffn_dim": 16
 }

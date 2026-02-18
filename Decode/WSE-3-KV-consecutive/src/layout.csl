@@ -20,7 +20,7 @@ param dim_p_pe: i16;
 param pes_p_head: i16;
 param pes_p_kv_head: i16;
 param head_dim_p_pe: i16;
-param seq_len_p_pe: i16;
+param max_seq_len_p_pe: i16;
 param ffn_dim_p_pe: i16;
 
 param pe_num_p_group: i16;
@@ -80,7 +80,7 @@ layout {
                 .pes_p_head = pes_p_head, 
                 .pes_p_kv_head = pes_p_kv_head,
                 .head_dim_p_pe = head_dim_p_pe,
-                .seq_len_p_pe = seq_len_p_pe,
+                .max_seq_len_p_pe = max_seq_len_p_pe,
                 .ffn_dim_p_pe = ffn_dim_p_pe,
 
                 .pe_num_p_group = pe_num_p_group,
@@ -96,10 +96,13 @@ layout {
     @export_name("Q_weight", [*]f16, true);
     @export_name("K_weight", [*]f16, true);
     @export_name("V_weight", [*]f16, true);
+    @export_name("output", [*]f16, true);
+    @export_name("score", [*]f16, true);
     @export_name("freqs_sin", [*]f16, true);
     @export_name("freqs_cos", [*]f16, true);
     @export_name("XKCache", [*]f16, true);
     @export_name("XVCache", [*]f16, true);
+    @export_name("QKV_tile", [*]f16, true);
     @export_name("O_weight", [*]f16, true);
     @export_name("UP_weight", [*]f16, true);
     @export_name("GATE_weight", [*]f16, true);
