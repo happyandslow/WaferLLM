@@ -576,7 +576,7 @@ fn print_dsd_data(curL : f16) void {
   prt.print_string(", ");
 }
 
-fn range_copy_strided(dest: *f16, src: *f16, size: u16, stride_dest: i8, stride_src: i8) void {
+fn range_copy_strided(dest: *f16, src: *f16, size: u16, stride_dest: i16, stride_src: i16) void {
     var dest_dsd = @get_dsd(mem1d_dsd, .{
         .base_address = dest,  
         .extent = size,
@@ -592,16 +592,16 @@ fn range_copy_strided(dest: *f16, src: *f16, size: u16, stride_dest: i8, stride_
         @load_to_dsr(src1_dsr_1, src_dsd, .{ .save_address = false });
         
         @fmovh(dest_dsr_1, src1_dsr_1);
-        dest_dsd = @increment_dsd_offset(dest_dsd, @as(i16, stride_dest), f16);
-        src_dsd = @increment_dsd_offset(src_dsd, @as(i16, stride_src), f16);
+        dest_dsd = @increment_dsd_offset(dest_dsd, stride_dest, f16);
+        src_dsd = @increment_dsd_offset(src_dsd, stride_src, f16);
     }
 }
 
 fn process_kv() void {
     var remain: i16 = step % P;
     if (py == remain){
-        range_copy_strided(&XKCache_tile[cur_kv_offset], &QKV_tile[bsz * dim_p_pe], dim_p_pe, @as(i8, dim_p_pe * max_seq_len_p_pe), @as(i8, dim_p_pe));
-        range_copy_strided(&XVCache_tile[cur_kv_offset], &QKV_tile[2 * bsz * dim_p_pe], dim_p_pe, @as(i8, dim_p_pe * max_seq_len_p_pe), @as(i8, dim_p_pe));
+        range_copy_strided(&XKCache_tile[cur_kv_offset], &QKV_tile[bsz * dim_p_pe], dim_p_pe, dim_p_pe * max_seq_len_p_pe, dim_p_pe);
+        range_copy_strided(&XVCache_tile[cur_kv_offset], &QKV_tile[2 * bsz * dim_p_pe], dim_p_pe, dim_p_pe * max_seq_len_p_pe, dim_p_pe);
         cur_kv_offset += dim_p_pe;
     }
 }
