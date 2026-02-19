@@ -30,6 +30,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Move to right unit test")
     parser.add_argument("--config", default="config.json", type=str, help="Config file")
     parser.add_argument("--simulator", action="store_true", help="Runs on simulator")
+    parser.add_argument("--warmup", default=5, type=int, help="Number of warmup iterations")
+    parser.add_argument("--repeat", default=50, type=int, help="Number of repeat iterations")
     args = parser.parse_args()
     return args
 
@@ -238,7 +240,8 @@ def main():
         # -------------------------------------------------------------------------- #
         runner.launch("init_task", nonblock=False)
 
-        total_warmup_times, total_repeat_times = 5, 50
+        total_warmup_times = args.warmup
+        total_repeat_times = args.repeat
         runner.launch("decode_host", np.int16(total_warmup_times), np.int16(total_repeat_times), nonblock=False)
         
         # -------------------------------------------------------------------------- #
