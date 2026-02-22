@@ -51,7 +51,7 @@ var head_dim: f16 = @as(f16,P * head_dim_p_pe);
 const eps: f16 = 0.000001;
 var alpha: f16 = 0.0;
 var step: i16 = 0;
-var cur_kv_offset: i16 = 0;
+var iter_num: i16 = 0;
 
 // -------------------------------------------------------------------------- //
 // --------------------------- WSE3 Modules Parameters ---------------------- //
@@ -566,25 +566,28 @@ fn simprint_pe_coords_dsd( dsd : mem1d_dsd) void {
   prt.print_u16_decimal(@as(u16, px));
   prt.print_string(",");
   prt.print_u16_decimal(@as(u16, py));
-  prt.print_string(":[");
-  @map(print_dsd_data, dsd);
+  prt.print_string("): [");
+  @map(print_data, dsd);
   prt.print_string("] ");
 }
 
-fn print_dsd_data(curL : f16) void {
+fn print_data(curL : f16) void {
   prt.print_f16(curL);
   prt.print_string(", ");
 }
 
-fn range_copy_strided(dest: *f16, src: *f16, size: u16, stride_dest: i16, stride_src: i16) void {
+
+fn range_copy_2d_strided(dest: *f16, src: *f16, size: u16, stride_dest_outer: i16, stride_dest_inner: i8, stride_src_outer: i16, stride_src_inner: i8) void {
     var dest_dsd = @get_dsd(mem1d_dsd, .{
         .base_address = dest,  
         .extent = size,
+        .stride = stride_dest_inner,
     });
 
     var src_dsd = @get_dsd(mem1d_dsd, .{
         .base_address = src,  
         .extent = size,
+        .stride = stride_src_inner,
     });
 
     for (@range(i16, bsz)) |b| {
@@ -592,21 +595,21 @@ fn range_copy_strided(dest: *f16, src: *f16, size: u16, stride_dest: i16, stride
         @load_to_dsr(src1_dsr_1, src_dsd, .{ .save_address = false });
         
         @fmovh(dest_dsr_1, src1_dsr_1);
-        dest_dsd = @increment_dsd_offset(dest_dsd, stride_dest, f16);
-        src_dsd = @increment_dsd_offset(src_dsd, stride_src, f16);
+        dest_dsd = @increment_dsd_offset(dest_dsd, stride_dest_outer, f16);
+        src_dsd = @increment_dsd_offset(src_dsd, stride_src_outer, f16);
     }
 }
 
 fn process_kv() void {
     var remain: i16 = step % P;
     if (py == remain){
-        range_copy_strided(&XKCache_tile[cur_kv_offset], &QKV_tile[bsz * dim_p_pe], dim_p_pe, dim_p_pe * max_seq_len_p_pe, dim_p_pe);
-        range_copy_strided(&XVCache_tile[cur_kv_offset], &QKV_tile[2 * bsz * dim_p_pe], dim_p_pe, dim_p_pe * max_seq_len_p_pe, dim_p_pe);
-        cur_kv_offset += dim_p_pe;
+        range_copy_2d_strided(&XKCache_tile[iter_num], &QKV_tile[bsz * dim_p_pe], dim_p_pe, dim_p_pe * max_seq_len_p_pe, @as(i8, max_seq_len_p_pe), dim_p_pe, 1);
+        range_copy_2d_strided(&XVCache_tile[iter_num * dim_p_pe], &QKV_tile[2 * bsz * dim_p_pe], dim_p_pe, dim_p_pe * max_seq_len_p_pe, 1, dim_p_pe, 1);
+        iter_num += 1;
     }
 }
 
-fn vecmat_computation_strided(width_right: i16) void {
+fn vecmat_computation_var_right(width_right: i16) void {
     left_vector_dsd = @set_dsd_length(left_vector_dsd, @bitcast(u16, Kt));
     right_matrix_dsd = @set_dsd_length(right_matrix_dsd, @bitcast(u16, Nt));
     out_vector_dsd = @set_dsd_length(out_vector_dsd, @bitcast(u16, Nt));
@@ -630,11 +633,38 @@ fn vecmat_computation_strided(width_right: i16) void {
 
 }
 
+fn vecmat_computation_var_right_2d_strided(right_stride: i16) void {
+    // Nt: iter_num 
+    // Kt: dim_p_pe 
+    // right_stride: max_seq_len_p_pe
+    left_vector_dsd = @set_dsd_length(left_vector_dsd, 1);
+    right_matrix_dsd = @set_dsd_length(right_matrix_dsd, @bitcast(u16, Nt));
+    out_vector_dsd = @set_dsd_length(out_vector_dsd, @bitcast(u16, Nt));
+
+    right_matrix_dsd = @set_dsd_base_addr(right_matrix_dsd, ptr_right_matrix);
+
+    for (@range(i16, bsz)) |b| {
+        
+        @load_to_dsr(dest_dsr_1, out_vector_dsd, .{ .save_address = false });
+        @load_to_dsr(src0_dsr_1, out_vector_dsd, .{ .save_address = false });
+
+        // calling Kt times with Nt width
+        for (@range(i16, Kt)) |k| {
+            @load_to_dsr(src1_dsr_1, right_matrix_dsd, .{ .save_address = false });
+            @map(gemv_static_step, left_vector_dsd);
+            left_vector_dsd = @increment_dsd_offset(left_vector_dsd, 1, f16);
+            right_matrix_dsd = @increment_dsd_offset(right_matrix_dsd, right_stride, f16);
+        }
+        out_vector_dsd = @increment_dsd_offset(out_vector_dsd, Nt, f16);
+    }
+}
+
+
+
 fn score_matvec_mult() void {
     score_dsd = @set_dsd_length(score_dsd, @bitcast(u16, max_seq_len_p_pe * bsz));
     @fmovh(score_dsd, 0.0);
     
-    var iter_num = cur_kv_offset / dim_p_pe;
     score_dsd = @set_dsd_length(score_dsd, @bitcast(u16, bsz * iter_num));
 
     left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_QKV_tile);
@@ -644,11 +674,17 @@ fn score_matvec_mult() void {
     out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_score);
 
     Kt = dim_p_pe;
+    
+    // Nt = max_seq_len_p_pe; //iter_num;
+    // vecmat_computation_var_right(dim_p_pe * max_seq_len_p_pe);
+
     Nt = iter_num;
-
-    vecmat_computation_strided(dim_p_pe * max_seq_len_p_pe);
-
+    vecmat_computation_var_right_2d_strided(max_seq_len_p_pe);
+    
+    // prt.print_string("score_dsd before reduce: ");
+    // simprint_pe_coords_dsd(score_dsd);
     comm_mod.all_reduce_bsz_var_seq_len_strided(px, quotient_x, remainder_x, ptr_score, @as(i16, iter_num));
+
 
     // score factor
     @load_to_dsr(dest_dsr_1, score_dsd);
@@ -657,12 +693,13 @@ fn score_matvec_mult() void {
 }
 
 fn softmax_score() void {
-    var iter_num = cur_kv_offset / dim_p_pe;
     
     seq_len_p_pe_dsd_1 = @set_dsd_length(seq_len_p_pe_dsd_1, @bitcast(u16, iter_num));
     seq_len_p_pe_dsd_2 = @set_dsd_length(seq_len_p_pe_dsd_2, @bitcast(u16, iter_num));
     score_dsd = @set_dsd_length(score_dsd, @bitcast(u16, iter_num * bsz));
     score_tmp_dsd = @set_dsd_length(score_tmp_dsd, @bitcast(u16, iter_num * bsz));
+    // prt.print_string("score_dsd before softmax: ");
+    // simprint_pe_coords_dsd(score_dsd);
     
     seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score);
     
@@ -706,10 +743,8 @@ fn softmax_score() void {
     
 }
 
-
 fn output_matvec_mult() void {
     @fmovh(output_dsd, 0.0);
-    var iter_num = cur_kv_offset / dim_p_pe;
 
     left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_score);
     
@@ -720,7 +755,7 @@ fn output_matvec_mult() void {
     Kt = iter_num;
     Nt = dim_p_pe;
 
-    vecmat_computation_strided(dim_p_pe * max_seq_len_p_pe);
+    vecmat_computation_var_right(dim_p_pe * max_seq_len_p_pe);
 
     comm_mod.all_reduce_bsz_dim(py, quotient_y, remainder_y, ptr_output);
 }

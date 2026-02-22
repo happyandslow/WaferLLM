@@ -916,25 +916,6 @@ fn all_reduce_bsz_var_seq_len_strided(pe_id: i16, quotient_pe_id: i16, remainder
     var var_bdcast_recv_bsz_seq_len = @set_dsd_length(bdcast_recv_bsz_seq_len, @as(u16, bsz * var_seq_len));
     var var_bdcast_send_bsz_seq_len = @set_dsd_length(bdcast_send_bsz_seq_len, @as(u16, bsz * var_seq_len));
     
-    // Allocate temporary contiguous buffer for active elements
-    // var temp_buf = @zeros([bsz * row_offset]f16); // Or use pre-allocated scratch space
-
-    // // Pack strided data into contiguous layout
-    // for (@range(i16, bsz)) |row| {
-    //     var src_dsd = @get_dsd(mem1d_dsd, .{
-    //         .base_address = vector_buf_ptr,
-    //         .extent = @as(u16, row_offset),
-    //         .stride = stride_len
-    //     });
-    //     var dst_dsd = @get_dsd(mem1d_dsd, .{
-    //         .base_address = &temp_buf,
-    //         .extent = @as(u16, row_offset)
-    //     });
-    //     @fmovh(dst_dsd, src_dsd);
-    //     src_dsd = @increment_dsd_offset(src_dsd, stride, f16);
-    //     dst_dsd = @increment_dsd_offset(dst_dsd, row_offset, f16);
-    // }
-    
     vector_buf_dsd_bsz_seq_len = @set_dsd_base_addr(vector_buf_dsd_bsz_seq_len, vector_buf_ptr);
     vector_buf_dsd_bsz_seq_len = @set_dsd_length(vector_buf_dsd_bsz_seq_len, @as(u16, bsz * var_seq_len));
     @load_to_dsr(vector_buf_dsr, vector_buf_dsd_bsz_seq_len);
@@ -1018,103 +999,7 @@ fn all_reduce_bsz_var_seq_len_strided(pe_id: i16, quotient_pe_id: i16, remainder
     } 
 }
 
-fn all_reduce_var_seq_len_strided(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16, vector_buf_ptr: [*]f16, row_offset: i16, stride_len: i16) void {
-    
-    var var_reduce_1st_0_recv_bsz_seq_len = @set_dsd_length(reduce_1st_0_recv_bsz_seq_len, @as(u16, row_offset));
-    var var_reduce_1st_1_recv_bsz_seq_len = @set_dsd_length(reduce_1st_1_recv_bsz_seq_len, @as(u16, row_offset));
-    var var_reduce_2nd_0_recv_bsz_seq_len = @set_dsd_length(reduce_2nd_0_recv_bsz_seq_len, @as(u16, row_offset));
-    var var_reduce_2nd_1_recv_bsz_seq_len = @set_dsd_length(reduce_2nd_1_recv_bsz_seq_len, @as(u16, row_offset));
-    var var_reduce_1st_0_send_bsz_seq_len = @set_dsd_length(reduce_1st_0_send_bsz_seq_len, @as(u16, row_offset));
-    var var_reduce_1st_1_send_bsz_seq_len = @set_dsd_length(reduce_1st_1_send_bsz_seq_len, @as(u16, row_offset));
-    var var_reduce_2nd_0_send_bsz_seq_len = @set_dsd_length(reduce_2nd_0_send_bsz_seq_len, @as(u16, row_offset));
-    var var_reduce_2nd_1_send_bsz_seq_len = @set_dsd_length(reduce_2nd_1_send_bsz_seq_len, @as(u16, row_offset));
-    var var_bdcast_send_bsz_seq_len = @set_dsd_length(bdcast_send_bsz_seq_len, @as(u16, row_offset));
-    var var_bdcast_recv_bsz_seq_len = @set_dsd_length(bdcast_recv_bsz_seq_len, @as(u16, row_offset));
-    
-    vector_buf_dsd_bsz_seq_len = @set_dsd_base_addr(vector_buf_dsd_bsz_seq_len, vector_buf_ptr);
-    vector_buf_dsd_bsz_seq_len = @set_dsd_length(vector_buf_dsd_bsz_seq_len, @as(u16, row_offset));
-    
-    for (@range(i16, bsz)) |row| {
-        @load_to_dsr(vector_buf_dsr, vector_buf_dsd_bsz_seq_len);
-            // 1st phase reduce
-        if (remainder_pe_id == root_1st_phase) {
-            if (root_1st_phase < pe_num_p_group - 1) {
-                @faddh(vector_buf_dsd_bsz_seq_len, var_reduce_1st_0_recv_bsz_seq_len, vector_buf_dsr);
-            }
-            @faddh(vector_buf_dsd_bsz_seq_len, var_reduce_1st_1_recv_bsz_seq_len, vector_buf_dsr);
-        } else if (remainder_pe_id > root_1st_phase) {
-            if (remainder_pe_id % 2 == 0) {
-                if (remainder_pe_id == pe_num_p_group - 1) {
-                    @fmovh(var_reduce_1st_0_send_bsz_seq_len, vector_buf_dsr);
-                } else {
-                    @faddh(var_reduce_1st_0_send_bsz_seq_len, var_reduce_1st_1_recv_bsz_seq_len, vector_buf_dsr);
-                }
-            } else {
-                // remainder_pe_id % 2 == 1
-                if (remainder_pe_id == pe_num_p_group - 1) {
-                    @fmovh(var_reduce_1st_1_send_bsz_seq_len, vector_buf_dsr);
-                } else {
-                    @faddh(var_reduce_1st_1_send_bsz_seq_len, var_reduce_1st_0_recv_bsz_seq_len, vector_buf_dsr);
-                }
-            }
-        } else {
-            // remainder_pe_id < root_1st_phase
-            if (remainder_pe_id % 2 == 0) {
-                if (remainder_pe_id == 0) {
-                    @fmovh(var_reduce_1st_1_send_bsz_seq_len, vector_buf_dsr);
-                } else {
-                    @faddh(var_reduce_1st_1_send_bsz_seq_len, var_reduce_1st_0_recv_bsz_seq_len, vector_buf_dsr);
-                }
-            } else {
-                // remainder_pe_id never be 0
-                @faddh(var_reduce_1st_0_send_bsz_seq_len, var_reduce_1st_1_recv_bsz_seq_len, vector_buf_dsr);
-            }
-        }
 
-        // 2nd phase reduce
-        if (pe_id == root_2nd_phase) {
-            if (root_2nd_phase < P - pe_num_p_group) {
-                @faddh(vector_buf_dsd_bsz_seq_len, var_reduce_2nd_0_recv_bsz_seq_len, vector_buf_dsr);
-            }
-            @faddh(vector_buf_dsd_bsz_seq_len, var_reduce_2nd_1_recv_bsz_seq_len, vector_buf_dsr);
-        } else if (pe_id > root_2nd_phase) {
-            if (remainder_pe_id == root_1st_phase) {
-                if (pe_id > P - pe_num_p_group - 1) {
-                    if (quotient_pe_id % 2 == 0) {
-                        @fmovh(var_reduce_2nd_0_send_bsz_seq_len, vector_buf_dsr);
-                    } else {
-                        @fmovh(var_reduce_2nd_1_send_bsz_seq_len, vector_buf_dsr);
-                    }
-                } else {
-                    if (quotient_pe_id % 2 == 0) {
-                        @faddh(var_reduce_2nd_0_send_bsz_seq_len, var_reduce_2nd_1_recv_bsz_seq_len, vector_buf_dsr);
-                    } else {
-                        @faddh(var_reduce_2nd_1_send_bsz_seq_len, var_reduce_2nd_0_recv_bsz_seq_len, vector_buf_dsr);
-                    }
-                }
-            }
-        } else {
-            if (remainder_pe_id == root_1st_phase) {
-                if (pe_id < pe_num_p_group) {
-                    @fmovh(var_reduce_2nd_1_send_bsz_seq_len, vector_buf_dsr);
-                } else {
-                    if (quotient_pe_id % 2 == 0) {
-                        @faddh(var_reduce_2nd_1_send_bsz_seq_len, var_reduce_2nd_0_recv_bsz_seq_len, vector_buf_dsr);
-                    } else {
-                        @faddh(var_reduce_2nd_0_send_bsz_seq_len, var_reduce_2nd_1_recv_bsz_seq_len, vector_buf_dsr);
-                    }
-                }
-            }
-        }
-        // Broadcast
-        if (pe_id == root_2nd_phase) {
-            @mov16(var_bdcast_send_bsz_seq_len, vector_buf_dsr);
-        } else {
-            @mov16(vector_buf_dsd_bsz_seq_len, var_bdcast_recv_bsz_seq_len);
-        }
-        vector_buf_dsd_bsz_seq_len = @increment_dsd_offset(vector_buf_dsd_bsz_seq_len, stride_len, f16);
-    }
-}
 
 
 fn all_reduce_bsz_ffn_dim_ZZ_fusion(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16, vector_buf_ptr: [*]f16) void {
