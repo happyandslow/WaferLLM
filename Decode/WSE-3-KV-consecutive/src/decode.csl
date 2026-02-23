@@ -947,8 +947,7 @@ fn decode_struct() void {
     comm_mod.reconfig_allreduce_axis(1);
 
     step += 1;
-
-    decode_entry();
+   
 }
 
 fn exit() void {
@@ -976,6 +975,19 @@ fn decode_host(total_warmup_times_: i16, total_repeat_times_: i16) void {
     decode_entry();
 }
 
+fn decode_once(total_warmup_times_: i16, total_repeat_times_: i16) void {
+    total_warmup_times = total_warmup_times_;
+    total_repeat_times = total_repeat_times_;
+    decode_struct();
+}
+
+fn finalize() void {
+    decode_struct();
+    timestamp.get_timestamp(&tsc_ref_buf);
+    timestamp.get_timestamp(&tsc_start_buf);
+    exit();
+}
+
 fn decode_entry() void {
     // Run (total_warmup_times + total_repeat_times) times; only the last `total_repeat_times` iterations are timed
     if (repeat_times == total_warmup_times + total_repeat_times) {
@@ -988,6 +1000,7 @@ fn decode_entry() void {
 
         repeat_times += 1;
         decode_struct();
+        decode_entry();
     }
 }
 
@@ -1053,6 +1066,8 @@ comptime {
 comptime {
     @export_symbol(init_task, "init_task");
     @export_symbol(decode_host, "decode_host");
+    @export_symbol(finalize, "finalize");
+    @export_symbol(decode_once, "decode_once");
 }
 
 comptime {

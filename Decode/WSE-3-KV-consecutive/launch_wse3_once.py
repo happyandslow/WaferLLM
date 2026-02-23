@@ -240,13 +240,15 @@ def main():
         # ------------------------------ Run WSE-3 ---------------------------- #
         # -------------------------------------------------------------------------- #
         runner.launch("init_task", nonblock=False)
-
+        start_time = time.time()
         total_warmup_times = args.warmup
         total_repeat_times = args.repeat
-        time = time.time()
-        runner.launch("decode_host", np.int16(total_warmup_times), np.int16(total_repeat_times), nonblock=False)
-        time = time.time() - time
-        print(f"Time measured at host: {time}")
+        for _ in range(total_repeat_times):
+            runner.launch("decode_once", nonblock=False)
+        runner.launch("finalize", nonblock=False)
+        duration = time.time() - start_time
+        print(f"Time measured at host: {duration}")
+        # runner.launch("decode_host", np.int16(total_warmup_times), np.int16(total_repeat_times), nonblock=False)
         
         # -------------------------------------------------------------------------- #
         # ------------------------------ D2H memcpy ------------------------------ #
