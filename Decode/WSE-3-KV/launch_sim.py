@@ -31,6 +31,7 @@ class Config:
 def parse_args():
     parser = argparse.ArgumentParser(description="Move to right unit test")
     parser.add_argument("--config", default="config.json", type=str, help="Config file")
+    parser.add_argument("--repeat_steps", default=32, type=int, help="Number of repeat steps")
     args = parser.parse_args()
     return args
 
@@ -241,7 +242,7 @@ def main():
     # -------------------------------------------------------------------------- #
     runner.launch("init_task", nonblock=False)
     
-    repeat_steps = 13
+    repeat_steps = args.repeat_steps
     warmup_steps = 0
     runner.launch("decode_host", np.int16(repeat_steps), np.int16(warmup_steps), nonblock=False)
     
@@ -321,17 +322,17 @@ def main():
     # Set NumPy print options to show entire arrays without truncation
     # np.set_printoptions(threshold=np.inf, edgeitems=10, linewidth=np.inf)
     
-    print(f"Xq: \n{Xq}")
-    print(f"Xk: \n{Xk}")
-    print(f"Xv: \n{Xv}")
-    print(f"Xqkv Result: \n{xqkv_result}")
+    # print(f"Xq: \n{Xq}")
+    # print(f"Xk: \n{Xk}")
+    # print(f"Xv: \n{Xv}")
+    # print(f"Xqkv Result: \n{xqkv_result}")
 
-    print(f"Xkcache Result: \n{xkcache_result}")
-    print(f"Xvcache Result: \n{xvcache_result}")
+    # print(f"Xkcache Result: \n{xkcache_result}")
+    # print(f"Xvcache Result: \n{xvcache_result}")
     
     
-    print(f"Intermediate Score:\n {intermediate_score}")
-    print(f"Intermediate Result:\n {intermediate_result}")
+    # print(f"Intermediate Score:\n {intermediate_score}")
+    # print(f"Intermediate Result:\n {intermediate_result}")
     
     
     

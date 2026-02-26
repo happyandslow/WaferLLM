@@ -66,8 +66,14 @@ def main():
     io_dtype = MemcpyDataType.MEMCPY_16BIT
     memcpy_order = MemcpyOrder.ROW_MAJOR
 
-    X = np.random.rand(1, bsz*dim).astype(np.float16)
-    X.fill(1.0)
+    # X = np.random.rand(1, bsz*dim).astype(np.float16)
+    # X.fill(1.0)
+    X = np.zeros((.1, bsz * dim), dtype=np.float16)
+    # for i in range(P):
+    #     for j in range(bsz):
+    #         X[0, i*dim_p_pe*bsz + j*dim_p_pe : i*dim_p_pe*bsz + (j+1)*dim_p_pe] = i + 1 # j + 1
+    for i in range(bsz * dim):
+        X[0, i] = (i + 1) * 0.1
     tensor_X = np.tile(X.reshape(P, bsz*dim_p_pe), reps=(1, P))
     
     print(f"Original X: {X}")
@@ -241,7 +247,7 @@ def main():
     # -------------------------------------------------------------------------- #
     runner.launch("init_task", nonblock=False)
     
-    repeat_steps = 10
+    repeat_steps = 1
     warmup_steps = 0
     runner.launch("decode_host", np.int16(repeat_steps), np.int16(warmup_steps), nonblock=False)
     

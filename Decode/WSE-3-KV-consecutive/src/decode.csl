@@ -975,9 +975,7 @@ fn decode_host(total_warmup_times_: i16, total_repeat_times_: i16) void {
     decode_entry();
 }
 
-fn decode_once(total_warmup_times_: i16, total_repeat_times_: i16) void {
-    total_warmup_times = total_warmup_times_;
-    total_repeat_times = total_repeat_times_;
+fn decode_once() void {
     decode_struct();
 }
 

@@ -854,6 +854,7 @@ fn all_reduce_bsz_seq_len(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16,
     var var_reduce_2nd_0_send_bsz_seq_len = @set_dsd_length(reduce_2nd_0_send_bsz_seq_len, @as(u16, seq_len_local));
     var var_reduce_2nd_1_send_bsz_seq_len = @set_dsd_length(reduce_2nd_1_send_bsz_seq_len, @as(u16, seq_len_local));
     var var_bdcast_recv_bsz_seq_len = @set_dsd_length(bdcast_recv_bsz_seq_len, @as(u16, seq_len_local));
+    var var_bdcast_send_bsz_seq_len = @set_dsd_length(bdcast_send_bsz_seq_len, @as(u16, seq_len_local));
 
     @load_to_dsr(vector_buf_dsr, vector_buf_dsd_bsz_seq_len);
 
