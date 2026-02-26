@@ -31,7 +31,6 @@ class Config:
 def parse_args():
     parser = argparse.ArgumentParser(description="Move to right unit test")
     parser.add_argument("--config", default="config.json", type=str, help="Config file")
-    parser.add_argument("--repeat_steps", default=32, type=int, help="Number of repeat steps")
     args = parser.parse_args()
     return args
 
@@ -62,13 +61,19 @@ def main():
     max_seq_len_p_pe = max_seq_len // P
     ffn_dim_p_pe = ffn_dim // P
     
-    print(f"Host: P: {P}, Batch size: {bsz}, dim_p_pe: {dim_p_pe}, pes_p_head: {pes_p_head}, pes_p_kv_head: {pes_p_kv_head}, head_dim_p_pe: {head_dim_p_pe}, max_seq_len_p_pe: {max_seq_len_p_pe}, ffn_dim_p_pe: {ffn_dim_p_pe}")
+    print(f"Host: P: {P}, Batch size: {bsz}, dim_p_pe: {dim_p_pe}, pes_p_head: {pes_p_head}, pes_p_kv_head: {pes_p_kv_head}, head_dim_p_pe: {head_dim_p_pe}, seq_len_p_pe: {max_seq_len_p_pe}, ffn_dim_p_pe: {ffn_dim_p_pe}")
     
     io_dtype = MemcpyDataType.MEMCPY_16BIT
     memcpy_order = MemcpyOrder.ROW_MAJOR
 
-    X = np.random.rand(1, bsz*dim).astype(np.float16)
-    X.fill(1.0)
+    # X = np.random.rand(1, bsz*dim).astype(np.float16)
+    # X.fill(1.0)
+    X = np.zeros((.1, bsz * dim), dtype=np.float16)
+    # for i in range(P):
+    #     for j in range(bsz):
+    #         X[0, i*dim_p_pe*bsz + j*dim_p_pe : i*dim_p_pe*bsz + (j+1)*dim_p_pe] = i + 1 # j + 1
+    for i in range(bsz * dim):
+        X[0, i] = (i + 1) * 0.1
     tensor_X = np.tile(X.reshape(P, bsz*dim_p_pe), reps=(1, P))
     
     print(f"Original X: {X}")
@@ -78,11 +83,10 @@ def main():
     W.fill(1.0)
     tensor_W = np.tile(W.reshape(P, dim_p_pe), reps=(1, P))
     
-    
     tensor_q_weight = np.random.rand(dim, dim).astype(np.float16)
     tensor_k_weight = np.random.rand(dim, dim).astype(np.float16)
     tensor_v_weight = np.random.rand(dim, dim).astype(np.float16)
-
+    
     tensor_q_weight.fill(1.0)
     tensor_k_weight.fill(2.0)
     tensor_v_weight.fill(3.0)
@@ -96,8 +100,8 @@ def main():
     freqs_cos = np.random.rand(1, P*_dim_p_pe//2).astype(np.float16)
     tensor_freqs_cos = np.tile(freqs_cos.reshape(P, _dim_p_pe//2), reps=(1, P))
     
-    # tensor_XKCache = np.random.rand(dim, max_seq_len).astype(np.float16)
-    # tensor_XVCache = np.random.rand(max_seq_len, dim).astype(np.float16)
+    # tensor_XKCache = np.random.rand(dim, seq_len).astype(np.float16)
+    # tensor_XVCache = np.random.rand(seq_len, dim).astype(np.float16)
     
     tensor_o_weight = np.random.rand(dim, dim).astype(np.float16)
     tensor_up_weight = np.random.rand(dim, ffn_dim).astype(np.float16)
@@ -137,6 +141,7 @@ def main():
     sym_QKV_tile = runner.get_id("QKV_tile")
     sym_XKCache = runner.get_id("XKCache")
     sym_XVCache = runner.get_id("XVCache")
+    
     
     # -------------------------------------------------------------------------- #
     # ------------------------------ H2D memcpy ------------------------------ #
@@ -188,7 +193,7 @@ def main():
     runner.memcpy_h2d(
         sym_freqs_cos, freqs_cos_u32, 0, 0, P, P, _dim_p_pe//2, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
     )
-    # Copy XKCache
+    # # Copy XKCache
     # XKCache_reshape = tensor_XKCache.reshape(P, dim_p_pe, P, seq_len_p_pe)
     # XKCache_transpose = XKCache_reshape.transpose(0, 2, 1, 3)
     # XKCache_reshape = XKCache_transpose.reshape(P, P, dim_p_pe * seq_len_p_pe)
@@ -242,7 +247,7 @@ def main():
     # -------------------------------------------------------------------------- #
     runner.launch("init_task", nonblock=False)
     
-    repeat_steps = args.repeat_steps
+    repeat_steps = 1
     warmup_steps = 0
     runner.launch("decode_host", np.int16(repeat_steps), np.int16(warmup_steps), nonblock=False)
     
@@ -256,10 +261,10 @@ def main():
     )
     debug = memcpy_view(debug_1d_u32, np.dtype(np.float16))
     debug = debug.reshape(P, bsz * dim)
-    
+
     score_1d_u32 = np.zeros(P * bsz * max_seq_len, dtype=np.uint32)
     runner.memcpy_d2h(
-        score_1d_u32, sym_score, 0, 0, P, P, bsz * max_seq_len_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
+        score_1d_u32, sym_score, 0, 0, P, P, bsz * max_seq_len_p_pe , streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
     )
     intermediate_score = memcpy_view(score_1d_u32, np.dtype(np.float16))
     intermediate_score = intermediate_score.reshape(P, bsz * max_seq_len)
@@ -292,6 +297,7 @@ def main():
     xvcache_result = memcpy_view(xvcache_1d_u32, np.dtype(np.float16))
     xvcache_result = xvcache_result.reshape(P, bsz * dim * max_seq_len_p_pe )
     
+    
     # -------------------------------------------------------------------------- #
     # ------------------------------ Timer Check ------------------------------ #
     # -------------------------------------------------------------------------- #
@@ -313,29 +319,21 @@ def main():
     print("Simulated Result:")
     print(debug)
     
-    
     Xq = np.matmul(X.reshape(bsz, dim), tensor_q_weight)
     Xk = np.matmul(X.reshape(bsz, dim), tensor_k_weight)
     Xv = np.matmul(X.reshape(bsz, dim), tensor_v_weight)
-    # print(f"tensor_q_weight: \n{tensor_q_weight}")
     
-    # Set NumPy print options to show entire arrays without truncation
-    # np.set_printoptions(threshold=np.inf, edgeitems=10, linewidth=np.inf)
-    
-    # print(f"Xq: \n{Xq}")
-    # print(f"Xk: \n{Xk}")
-    # print(f"Xv: \n{Xv}")
-    # print(f"Xqkv Result: \n{xqkv_result}")
+    print(f"Xq: \n{Xq}")
+    print(f"Xk: \n{Xk}")
+    print(f"Xv: \n{Xv}")
+    print(f"Xqkv Result: \n{xqkv_result}")
 
-    # print(f"Xkcache Result: \n{xkcache_result}")
-    # print(f"Xvcache Result: \n{xvcache_result}")
+    print(f"Xkcache Result: \n{xkcache_result}")
+    print(f"Xvcache Result: \n{xvcache_result}")
     
     
-    # print(f"Intermediate Score:\n {intermediate_score}")
-    # print(f"Intermediate Result:\n {intermediate_result}")
-    
-    
-    
+    print(f"Intermediate Score:\n {intermediate_score}")
+    print(f"Intermediate Result:\n {intermediate_result}")
     
     debug_mod = debug_util("out")
     core_offset_x = 4

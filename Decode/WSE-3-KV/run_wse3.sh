@@ -13,6 +13,24 @@ if [ -n "$2" ]; then
     simulator=$2
 fi
 
+warmup=5
+
+if [ -n "$3" ]; then
+    warmup=$3
+fi
+
+repeat=50
+
+if [ -n "$4" ]; then
+    repeat=$4
+fi
+
+once=false
+
+if [ -n "$5" ]; then
+    once=$5
+fi
+
 # if config.json exists
 if [ -f $CONFIG ]; then
     echo "Use config values from $CONFIG."
@@ -70,10 +88,14 @@ echo "Simulator: $simulator"
 
 python compile.py $P $BSZ $dim_p_pe $pes_p_head $pes_p_kv_head $head_dim_p_pe $max_seq_len_p_pe $ffn_dim_p_pe $pe_num_p_group $root_1st_phase $root_2nd_phase $simulator
 
-if [ "$simulator" == "true" ]; then
-    python launch_wse3.py --config $CONFIG --simulator
+if [ "$once" == "true" ]; then
+    python launch_wse3_once.py --config $CONFIG --warmup $warmup --repeat $repeat
 else
-    python launch_wse3.py --config $CONFIG
+    if [ "$simulator" == "true" ]; then
+        python launch_wse3.py --config $CONFIG --simulator --warmup $warmup --repeat $repeat
+    else
+        python launch_wse3.py --config $CONFIG --warmup $warmup --repeat $repeat
+    fi
 fi
 
 rm -rf simfab_traces

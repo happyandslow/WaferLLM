@@ -2,6 +2,7 @@ import json
 import os
 import signal
 import struct
+import time
 import argparse
 import numpy as np
 
@@ -30,6 +31,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Move to right unit test")
     parser.add_argument("--config", default="config.json", type=str, help="Config file")
     parser.add_argument("--simulator", action="store_true", help="Runs on simulator")
+    parser.add_argument("--warmup", default=5, type=int, help="Number of warmup iterations")
+    parser.add_argument("--repeat", default=50, type=int, help="Number of repeat iterations")
     args = parser.parse_args()
     return args
 
@@ -50,18 +53,16 @@ def main():
     n_heads = config.n_heads
     n_kv_heads = config.n_kv_heads
     head_dim = config.head_dim
-    # seq_len = config.seq_len
+    max_seq_len = config.max_seq_len
     ffn_dim = config.ffn_dim
     layer_num = config.layer_num
     dim_p_pe = dim // P
     pes_p_head = P // n_heads
     pes_p_kv_head = P // n_kv_heads
     head_dim_p_pe = head_dim // P
-    # seq_len_p_pe = seq_len // P
-    ffn_dim_p_pe = ffn_dim // P
-    max_seq_len = config.max_seq_len
     max_seq_len_p_pe = max_seq_len // P
-    
+    ffn_dim_p_pe = ffn_dim // P
+
     print(f"Host: P: {P}, Batch size: {bsz}, dim_p_pe: {dim_p_pe}, pes_p_head: {pes_p_head}, pes_p_kv_head: {pes_p_kv_head}, head_dim_p_pe: {head_dim_p_pe}, ffn_dim_p_pe: {ffn_dim_p_pe}, simulator: {args.simulator}")
     
     io_dtype = MemcpyDataType.MEMCPY_16BIT
@@ -86,8 +87,8 @@ def main():
     freqs_cos = np.random.rand(1, P*_dim_p_pe//2).astype(np.float16)
     tensor_freqs_cos = np.tile(freqs_cos.reshape(P, _dim_p_pe//2), reps=(1, P))
     
-    # tensor_XKCache = np.random.rand(dim, seq_len).astype(np.float16)
-    # tensor_XVCache = np.random.rand(seq_len, dim).astype(np.float16)
+    # tensor_XKCache = np.random.rand(dim, max_seq_len).astype(np.float16)
+    # tensor_XVCache = np.random.rand(max_seq_len, dim).astype(np.float16)
     
     tensor_o_weight = np.random.rand(dim, dim).astype(np.float16)
     tensor_up_weight = np.random.rand(dim, ffn_dim).astype(np.float16)
@@ -180,7 +181,7 @@ def main():
         runner.memcpy_h2d(
             sym_freqs_cos, freqs_cos_u32, 0, 0, P, P, _dim_p_pe//2, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
         )
-        # Copy XKCache
+        # # Copy XKCache
         # XKCache_reshape = tensor_XKCache.reshape(P, dim_p_pe, P, seq_len_p_pe)
         # XKCache_transpose = XKCache_reshape.transpose(0, 2, 1, 3)
         # XKCache_reshape = XKCache_transpose.reshape(P, P, dim_p_pe * seq_len_p_pe)
@@ -240,8 +241,12 @@ def main():
         # -------------------------------------------------------------------------- #
         runner.launch("init_task", nonblock=False)
 
-        total_warmup_times, total_repeat_times = 5, 50
+        total_warmup_times = args.warmup
+        total_repeat_times = args.repeat
+        time = time.time()
         runner.launch("decode_host", np.int16(total_warmup_times), np.int16(total_repeat_times), nonblock=False)
+        time = time.time() - time
+        print(f"Time measured at host: {time}")
         
         # -------------------------------------------------------------------------- #
         # ------------------------------ D2H memcpy ------------------------------ #

@@ -28,7 +28,7 @@ else
     N_HEADS=1
     N_KV_HEADS=1
     HEAD_DIM=64
-    MAX_SEQ_LEN=64
+    SEQ_LEN=64
     FFN_DIM=64
 fi
 
@@ -52,7 +52,7 @@ echo "DIM: $DIM"
 echo "N_HEADS: $N_HEADS"
 echo "N_KV_HEADS: $N_KV_HEADS"
 echo "HEAD_DIM: $HEAD_DIM"
-echo "MAX_SEQ_LEN: $MAX_SEQ_LEN"
+echo "SEQ_LEN: $SEQ_LEN"
 echo "FFN_DIM: $FFN_DIM"
 
 echo "GROUP_NUM: $GROUP_NUM"
