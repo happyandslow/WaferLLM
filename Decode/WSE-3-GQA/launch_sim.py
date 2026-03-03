@@ -9,12 +9,245 @@ from cerebras.sdk.debug.debug_util import debug_util
 from cerebras.sdk.runtime.sdkruntimepybind import SdkRuntime
 from cerebras.sdk.runtime.sdkruntimepybind import MemcpyDataType, MemcpyOrder
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Reference implementations matching decode.csl exactly
+# ─────────────────────────────────────────────────────────────────────────────
+
+EPS = 1e-6   # matches CSL: const eps: f16 = 0.000001
+
+def rmsnorm_csl(X, W, head_dim):
+    """
+    CSL formula (decode.csl rmsnorm_x):
+      X_tmp = X^2
+      local_sum[b] = sum(X_tmp[b])  → Y-reduced globally
+      X_norm[b] = X_tmp[b] * W / sqrt(local_sum[b] / head_dim + eps)
+    """
+    x32 = X.astype(np.float32)
+    w32 = W.astype(np.float32)
+    ss = np.sum(x32 ** 2, axis=-1, keepdims=True)
+    return (x32**2 * w32 / np.sqrt(ss / head_dim + EPS)).astype(np.float16)
+
+def rope_csl(x, freqs_cos, freqs_sin):
+    """
+    CSL formula (decode.csl xq_rope / xk_rope):
+      even_new = x_odd * cos - x_even * sin
+      odd_new  = x_even * cos + x_odd * sin
+    """
+    x32 = x.astype(np.float32)
+    cos = freqs_cos.astype(np.float32)
+    sin = freqs_sin.astype(np.float32)
+    xe = x32[:, 0::2]
+    xo = x32[:, 1::2]
+    out = np.empty_like(x32)
+    out[:, 0::2] = xo * cos - xe * sin
+    out[:, 1::2] = xe * cos + xo * sin
+    return out.astype(np.float16)
+
+def fast_exp_csl(x):
+    """CSL fast_exp: (1 + x/256)^4  — matches decode.csl exactly (2 squarings, f16).
+    NOT e^x: only a very crude approximation. Valid only near x≈0."""
+    tmp = x.astype(np.float16)
+    tmp = np.float16(1.0) + tmp / np.float16(256.0)
+    tmp = tmp * tmp   # ^2
+    tmp = tmp * tmp   # ^4
+    return tmp
+
+def softmax_csl(score):
+    """CSL softmax_score: fast_exp approx with Y-reduced max and sum."""
+    s32 = score.astype(np.float32)
+    mx = np.max(s32, axis=-1, keepdims=True)
+    e = fast_exp_csl(s32 - mx)
+    return (e / np.sum(e, axis=-1, keepdims=True)).astype(np.float16)
+
+def compute_reference(X, W_norm, W_Q_perm, W_K, W_V, freqs_cos, freqs_sin,
+                      XKCache, XVCache, P, n_heads, n_kv_heads, head_dim,
+                      dim_p_pe, kv_dim_p_pe, seq_len_p_pe, gqa_group_size, pes_p_kv_head):
+    """
+    Compute expected values at each validation step, matching CSL GQA Phase 2 (Option C) exactly.
+    W_Q_perm: permuted Q weight [dim, dim].  W_K, W_V: compact [dim, kv_dim].
+    XKCache: compact [kv_dim, seq_len].  XVCache: compact [seq_len, kv_dim].
+    Returns a dict with keys: X_norm, Q_perm, K, V, attn_per_head, output_grid
+    """
+    kv_dim = n_kv_heads * head_dim
+    alpha = np.float16(1.0 / np.sqrt(head_dim))
+    seq_len = XKCache.shape[1]
+    bsz = X.shape[0]
+
+    # Step 1: RMSNorm disabled
+    X_norm = X
+
+    # Step 2: Projections using permuted W_Q and compact W_K/V
+    Q_perm = (X_norm.astype(np.float32) @ W_Q_perm.astype(np.float32)).astype(np.float16)  # [bsz, dim]
+    K = (X_norm.astype(np.float32) @ W_K.astype(np.float32)).astype(np.float16)             # [bsz, kv_dim]
+    V = (X_norm.astype(np.float32) @ W_V.astype(np.float32)).astype(np.float16)             # [bsz, kv_dim]
+
+    # Step 3: RoPE disabled
+    Q_rope = Q_perm
+    K_rope = K
+
+    # Step 4+5: Attention per Q-head, KV-head-scoped reduce
+    # For head h = kv_head * gqa_group_size + g:
+    #   Q_h is reconstructed from Q_perm by collecting kv_dim_p_pe-wide slices
+    #   across all pes_p_kv_head PEs in the KV-head block for group g.
+    score_per_head = np.zeros((n_heads, bsz, seq_len), dtype=np.float32)
+    for h in range(n_heads):
+        kv_head = h // gqa_group_size
+        g = h % gqa_group_size
+        # Reconstruct Q_h from permuted Q layout
+        Q_h = np.zeros((bsz, head_dim), dtype=np.float32)
+        for s in range(pes_p_kv_head):
+            px = kv_head * pes_p_kv_head + s
+            col_start = px * dim_p_pe + g * kv_dim_p_pe
+            Q_h[:, s * kv_dim_p_pe:(s + 1) * kv_dim_p_pe] = Q_perm[:, col_start:col_start + kv_dim_p_pe].astype(np.float32)
+        # K for this KV-head
+        K_kv = XKCache[kv_head * head_dim:(kv_head + 1) * head_dim, :]  # [head_dim, seq_len]
+        score_per_head[h] = Q_h @ K_kv.astype(np.float32)
+
+    score_scaled = (score_per_head * float(alpha)).astype(np.float16)
+    attn_per_head = np.stack([softmax_csl(score_scaled[h]) for h in range(n_heads)])  # [n_heads, bsz, seq_len]
+
+    # Step 6: Output per head; result in permuted layout matching output_tile in CSL
+    # PE px, group g: output_g = attn[h] @ XVCache[:, px*kv_dim_p_pe:(px+1)*kv_dim_p_pe]
+    # After Y-reduce; build [P, P, bsz*dim_p_pe] reference grid
+    output_grid = np.zeros((P, P, bsz * dim_p_pe), dtype=np.float32)
+    for px in range(P):
+        kv_head = px // pes_p_kv_head
+        v_slice = XVCache[:, px * kv_dim_p_pe:(px + 1) * kv_dim_p_pe]  # [seq_len, kv_dim_p_pe]
+        for g in range(gqa_group_size):
+            h = kv_head * gqa_group_size + g
+            out_g = (attn_per_head[h].astype(np.float32) @ v_slice.astype(np.float32)).astype(np.float16)  # [bsz, kv_dim_p_pe]
+            for py in range(P):  # Y-reduce → all py identical
+                output_grid[py, px, g * bsz * kv_dim_p_pe:(g + 1) * bsz * kv_dim_p_pe] = out_g.ravel()
+
+    return {
+        'X_norm':        X_norm,
+        'Q_perm':        Q_perm,            # [bsz, dim] — permuted Q (no RoPE)
+        'K':             K,                 # [bsz, kv_dim]
+        'V':             V,                 # [bsz, kv_dim]
+        'attn_per_head': attn_per_head,     # [n_heads, bsz, seq_len]
+        'output_grid':   output_grid.astype(np.float16),  # [P, P, bsz*dim_p_pe]
+    }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Validation helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def sep(title):
+    print(f"\n{'═'*64}")
+    print(f"  {title}")
+    print(f"{'═'*64}")
+
+def show(name, arr, n=6):
+    flat = arr.astype(np.float32).ravel()
+    vals = "  ".join(f"{v:8.4f}" for v in flat[:n])
+    tail = " ..." if len(flat) > n else ""
+    print(f"  {name:36s} {vals}{tail}")
+
+def show_all(name, grid, n=None, ref_grid=None, row_label="py"):
+    """Print a grid [rows, cols, data] in WSE-3 debug format.
+
+    For each row, concatenate data across all col entries and print one line.
+    If ref_grid is provided, print a sim line and a ref line per row.
+
+    Typical uses:
+      PE grid:    grid [P, P, data_per_pe], row_label="py"   — rows=py, cols=px
+      Head output: grid [n_heads, bsz, seq_len], row_label="head" — rows=head, cols=bsz
+    """
+    n_rows, n_cols = grid.shape[0], grid.shape[1]
+    print(f"  {name}:")
+    for row in range(n_rows):
+        sim_row = np.concatenate([grid[row, c, :] for c in range(n_cols)]).astype(np.float32)
+        truncated = n is not None and len(sim_row) > n
+        def fmt(arr):
+            v = "  ".join(f"{v:8.4f}" for v in (arr[:n] if truncated else arr))
+            return v + (" ..." if truncated else "")
+        prefix = f"    {row_label}={row}"
+        if ref_grid is None:
+            print(f"{prefix}: [{fmt(sim_row)}]")
+        else:
+            ref_row = np.concatenate(
+                [ref_grid[row, c, :] for c in range(n_cols)]
+            ).astype(np.float32)
+            print(f"{prefix} sim: [{fmt(sim_row)}]")
+            print(f"{prefix} ref: [{fmt(ref_row)}]")
+
+def cmp(name, sim, ref, atol=0.15):
+    s = sim.astype(np.float32).ravel()
+    r = ref.astype(np.float32).ravel()
+    max_err = float(np.max(np.abs(s - r)))
+    ok = max_err <= atol
+    print(f"  [{'PASS' if ok else 'FAIL'}] {name:42s}  max_err={max_err:.5f}")
+    if not ok:
+        print(f"         sim: {s[:6]}")
+        print(f"         ref: {r[:6]}")
+    return ok
+
+def reconstruct_QKV(qkv_grid, bsz, dim_p_pe, kv_dim_p_pe, P):
+    """
+    qkv_grid: [P, P, bsz*(dim_p_pe + 2*kv_dim_p_pe)]  (indexed [py, px, ...])
+    Returns Q [bsz, dim], K [bsz, kv_dim], V [bsz, kv_dim] using py=0.
+    """
+    dim = P * dim_p_pe
+    kv_dim = P * kv_dim_p_pe
+    Q = np.zeros((bsz, dim), dtype=np.float16)
+    K = np.zeros((bsz, kv_dim), dtype=np.float16)
+    V = np.zeros((bsz, kv_dim), dtype=np.float16)
+    for px in range(P):
+        pe = qkv_grid[0, px, :]  # [bsz*(dim_p_pe + 2*kv_dim_p_pe)]
+        Q[:, px * dim_p_pe:(px + 1) * dim_p_pe] = pe[0:bsz * dim_p_pe].reshape(bsz, dim_p_pe)
+        K[:, px * kv_dim_p_pe:(px + 1) * kv_dim_p_pe] = pe[bsz * dim_p_pe:bsz * (dim_p_pe + kv_dim_p_pe)].reshape(bsz, kv_dim_p_pe)
+        V[:, px * kv_dim_p_pe:(px + 1) * kv_dim_p_pe] = pe[bsz * (dim_p_pe + kv_dim_p_pe):].reshape(bsz, kv_dim_p_pe)
+    return Q, K, V
+
+def reconstruct_score(score_grid, bsz, seq_len_p_pe, P, n_heads, n_kv_heads, gqa_group_size):
+    """
+    score_grid: [P, P, bsz*gqa_group_size*seq_len_p_pe]  — all GQA groups per KV-head.
+    Returns attn [n_heads, bsz, seq_len] using the first PE of each KV-head.
+    After kv-head-scoped X-reduce + softmax, all PEs in a KV-head have same score for their group.
+    score buffer in CSL holds gqa_group_size sub-heads: [g0: bsz*seq_len_p_pe, g1: bsz*seq_len_p_pe, ...]
+    """
+    pes_p_kv_head = P // n_kv_heads
+    seq_len = P * seq_len_p_pe
+    attn = np.zeros((n_heads, bsz, seq_len), dtype=np.float16)
+    for h in range(n_heads):
+        kv_head = h // gqa_group_size
+        g = h % gqa_group_size
+        px_kv = kv_head * pes_p_kv_head   # representative PE for KV-head
+        for py in range(P):
+            pe = score_grid[py, px_kv, :]  # [bsz*gqa_group_size*seq_len_p_pe]
+            g_start = g * bsz * seq_len_p_pe
+            g_end   = (g + 1) * bsz * seq_len_p_pe
+            attn[h, :, py * seq_len_p_pe:(py + 1) * seq_len_p_pe] = pe[g_start:g_end].reshape(bsz, seq_len_p_pe)
+    return attn
+
+def reconstruct_output(out_grid, bsz, dim_p_pe, P):
+    """
+    out_grid: [P, P, bsz*dim_p_pe]
+    Returns output [bsz, dim] using py=0 (Y-reduce → all py identical).
+    """
+    out = np.zeros((bsz, P * dim_p_pe), dtype=np.float16)
+    for px in range(P):
+        out[:, px * dim_p_pe: (px + 1) * dim_p_pe] = out_grid[0, px, :].reshape(bsz, dim_p_pe)
+    return out
+
+def d2h(runner, sym_id, P, bsz, data_per_pe, io_dtype, memcpy_order):
+    """Read P×P PEs, each contributing data_per_pe f16 values."""
+    buf = np.zeros(P * bsz * data_per_pe * P, dtype=np.uint32)
+    runner.memcpy_d2h(
+        buf, sym_id, 0, 0, P, P, bsz * data_per_pe,
+        streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
+    )
+    return memcpy_view(buf, np.dtype(np.float16)).reshape(P, P, bsz * data_per_pe)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
 def float_to_hex(f):
     return hex(struct.unpack("<I", struct.pack("<f", f))[0])
 
 def make_u48(words):
     return words[0] + (words[1] << 16) + (words[2] << 32)
-
 
 class Config:
     def __init__(self):
@@ -29,261 +262,489 @@ class Config:
         self.ffn_dim = 64
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Move to right unit test")
-    parser.add_argument("--config", default="config.json", type=str, help="Config file")
-    args = parser.parse_args()
-    return args
+    parser = argparse.ArgumentParser(description="WSE-3-GQA decode simulator")
+    parser.add_argument("--config", default="config.json", type=str)
+    parser.add_argument("--simple", action="store_true",
+                        help="Use constant matrices (fill value) for easy hand-verification")
+    parser.add_argument("--fill", type=float, default=1.0,
+                        help="Constant fill value for --simple mode (default 1.0)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed for reproducibility")
+    parser.add_argument("--validate", action="store_true",
+                        help="Read intermediate buffers and compare against numpy reference")
+    return parser.parse_args()
 
 def main():
     args = parse_args()
     config = Config()
-    
+
     if not os.path.exists(args.config):
         print("Host: Use default test values.")
     else:
         with open(args.config) as f:
             config.__dict__.update(json.load(f))
-            
-    P = config.P
-    bsz = config.bsz
-    group_num = config.group_num
-    dim = config.dim
-    n_heads = config.n_heads
+
+    P          = config.P
+    bsz        = config.bsz
+    group_num  = config.group_num
+    dim        = config.dim
+    n_heads    = config.n_heads
     n_kv_heads = config.n_kv_heads
-    head_dim = config.head_dim
-    seq_len = config.seq_len
-    ffn_dim = config.ffn_dim
-    
-    dim_p_pe = dim // P
-    pes_p_head = P // n_heads
-    pes_p_kv_head = P // n_kv_heads
-    head_dim_p_pe = head_dim // P  
-    seq_len_p_pe = seq_len // P
-    ffn_dim_p_pe = ffn_dim // P
-    
-    print(f"Host: P: {P}, Batch size: {bsz}, dim_p_pe: {dim_p_pe}, pes_p_head: {pes_p_head}, pes_p_kv_head: {pes_p_kv_head}, head_dim_p_pe: {head_dim_p_pe}, seq_len_p_pe: {seq_len_p_pe}, ffn_dim_p_pe: {ffn_dim_p_pe}")
-    
-    io_dtype = MemcpyDataType.MEMCPY_16BIT
+    head_dim   = config.head_dim
+    seq_len    = config.seq_len
+    ffn_dim    = config.ffn_dim
+
+    dim_p_pe       = dim // P
+    pes_p_head     = P // n_heads
+    pes_p_kv_head  = P // n_kv_heads
+    head_dim_p_pe  = head_dim // P
+    seq_len_p_pe   = seq_len // P
+    ffn_dim_p_pe   = ffn_dim // P
+    kv_dim         = n_kv_heads * head_dim
+    kv_dim_p_pe    = kv_dim // P
+    gqa_group_size = n_heads // n_kv_heads
+    _kv_dim_p_pe   = (kv_dim_p_pe // 2) * 2
+
+    print(f"Host: P={P}  bsz={bsz}  dim={dim}  n_heads={n_heads}  n_kv_heads={n_kv_heads}  gqa_group_size={gqa_group_size}")
+    print(f"      head_dim={head_dim}  seq_len={seq_len}  ffn_dim={ffn_dim}")
+    print(f"      dim_p_pe={dim_p_pe}  kv_dim_p_pe={kv_dim_p_pe}  pes_p_head={pes_p_head}  pes_p_kv_head={pes_p_kv_head}  seq_len_p_pe={seq_len_p_pe}")
+    if args.simple:
+        print(f"  [simple mode: fill={args.fill}  identity RoPE  easy hand-verification]")
+
+    if args.seed is not None:
+        np.random.seed(args.seed)
+
+    io_dtype    = MemcpyDataType.MEMCPY_16BIT
     memcpy_order = MemcpyOrder.ROW_MAJOR
 
-    X = np.random.rand(1, bsz*dim).astype(np.float16)
-    tensor_X = np.tile(X.reshape(P, bsz*dim_p_pe), reps=(1, P))
+    # ─── Build input / weight tensors ─────────────────────────────────────────
+    def mk(*shape, fill=args.fill):
+        if args.simple:
+            return np.full(shape, fill, dtype=np.float16)
+        return np.random.rand(*shape).astype(np.float16)
     
-    W = np.random.rand(1, dim).astype(np.float16)
-    tensor_W = np.tile(W.reshape(P, dim_p_pe), reps=(1, P))
-    
-    tensor_q_weight = np.random.rand(dim, dim).astype(np.float16)
-    tensor_k_weight = np.random.rand(dim, dim).astype(np.float16)
-    tensor_v_weight = np.random.rand(dim, dim).astype(np.float16)
-    
-    _dim_p_pe = dim_p_pe
-    if (dim_p_pe % 2) == 1:
-        _dim_p_pe = dim_p_pe - 1
-    
-    freqs_sin = np.random.rand(1, P*_dim_p_pe//2).astype(np.float16)
-    tensor_freqs_sin = np.tile(freqs_sin.reshape(P, _dim_p_pe//2), reps=(1, P))
-    freqs_cos = np.random.rand(1, P*_dim_p_pe//2).astype(np.float16)
-    tensor_freqs_cos = np.tile(freqs_cos.reshape(P, _dim_p_pe//2), reps=(1, P))
-    
-    tensor_XKCache = np.random.rand(dim, seq_len).astype(np.float16)
-    tensor_XVCache = np.random.rand(seq_len, dim).astype(np.float16)
-    
-    tensor_o_weight = np.random.rand(dim, dim).astype(np.float16)
-    tensor_up_weight = np.random.rand(dim, ffn_dim).astype(np.float16)
-    tensor_gate_weight = np.random.rand(dim, ffn_dim).astype(np.float16)
-    tensor_down_weight = np.random.rand(ffn_dim, dim).astype(np.float16)
+    def mk_dim(*shape):
+        if args.simple:
+            X = np.zeros(shape, dtype=np.float16)
+            # Iterate over all elements regardless of shape
+            for idx in np.ndindex(*shape):
+                # idx is a tuple like (0,), (0,0), (0,0,0), etc. depending on shape
+                # Example: set value based on index
+                X[idx] = sum(idx) * 0.1
+            return X
+        return np.random.rand(*shape).astype(np.float16)
 
-    # runner = SdkRuntime("out", suppress_simfab_trace=True, simfab_numthreads=64, msg_level='INFO')
+    # Raw 1D input (same at every PE row — tiled below)
+    # X_raw    = mk(1, bsz * dim, fill=args.fill)                      # [1, bsz*dim]
+    X_raw    = mk(1, bsz * dim, fill=.1) #mk_dim(1, bsz * dim)
+    W_raw    = mk(1, dim, fill=args.fill)                             # [1, dim] — RMSNorm weights
+
+    
+    tensor_q_weight = mk_dim(dim, dim) * 0.1
+    # tensor_k_weight = mk_dim(dim, kv_dim) * 0.1
+    # tensor_v_weight = mk_dim(dim, kv_dim) * 0.1
+    tensor_k_weight = mk(dim, kv_dim, fill=.2)
+    tensor_v_weight = mk(dim, kv_dim, fill=.3)
+    # tensor_q_weight = mk(dim, dim, fill=1)
+    # tensor_k_weight = mk(dim, dim, fill=2)
+    # tensor_v_weight = mk(dim, dim, fill=3)
+    # tensor_q_weight = mk_dim(dim, dim)
+    # tensor_k_weight = mk(dim, dim)
+    # tensor_v_weight = mk(dim, dim)
+
+    # RMSNorm reference weight (same at every PE, PE's slice = W[px*dim_p_pe:])
+    W_norm_flat = W_raw.ravel()                       # [dim]
+
+    _dim_p_pe = dim_p_pe if (dim_p_pe % 2 == 0) else dim_p_pe - 1
+
+    # RoPE: identity for simple mode, head-local otherwise
+    if args.simple:
+        freqs_cos_full = np.ones(P * (_dim_p_pe // 2), dtype=np.float16)
+        freqs_sin_full = np.zeros(P * (_dim_p_pe // 2), dtype=np.float16)
+        # Each PE gets its own slice reshaped below; for flat storage:
+        base_cos = np.ones(head_dim // 2, dtype=np.float16)
+        base_sin = np.zeros(head_dim // 2, dtype=np.float16)
+    else:
+        base_cos = np.random.rand(head_dim // 2).astype(np.float16)
+        base_sin = np.random.rand(head_dim // 2).astype(np.float16)
+
+    _half_head = (head_dim_p_pe // 2 * 2) // 2
+    pe_freqs_sin = np.zeros((P, _dim_p_pe // 2), dtype=np.float16)
+    pe_freqs_cos = np.zeros((P, _dim_p_pe // 2), dtype=np.float16)
+    for _px in range(P):
+        s     = _px % pes_p_head
+        start = s * _half_head
+        end   = start + _half_head
+        if _half_head > 0:
+            pe_freqs_sin[_px, :] = np.tile(base_sin[start:end], n_heads)
+            pe_freqs_cos[_px, :] = np.tile(base_cos[start:end], n_heads)
+    # Freqs must vary with px (column), not py (row):
+    # PE(px,py) gets pe_freqs[px,:] via ROW_MAJOR memcpy [py, px*count:(px+1)*count]
+    # → tile pe_freqs.ravel() (which is [pe0, pe1, ..., pe_{P-1}]) uniformly across all rows
+    tensor_freqs_sin = np.tile(pe_freqs_sin.ravel(), (P, 1))
+    tensor_freqs_cos = np.tile(pe_freqs_cos.ravel(), (P, 1))
+
+    # Build global freqs arrays for reference computation (size dim//2)
+    freqs_cos_ref = np.zeros(dim // 2, dtype=np.float16)
+    freqs_sin_ref = np.zeros(dim // 2, dtype=np.float16)
+    for _px in range(P):
+        off = _px * (dim_p_pe // 2)
+        freqs_cos_ref[off: off + _dim_p_pe // 2] = pe_freqs_cos[_px, :]
+        freqs_sin_ref[off: off + _dim_p_pe // 2] = pe_freqs_sin[_px, :]
+
+    tensor_XKCache = mk(kv_dim, seq_len, fill=.4)
+    tensor_XVCache = mk(seq_len, kv_dim, fill=.5)
+    tensor_o_weight   = mk(dim, dim)
+    tensor_up_weight  = mk(dim, ffn_dim)
+    tensor_gate_weight = mk(dim, ffn_dim)
+    tensor_down_weight = mk(ffn_dim, dim)
+
+    # ─── W_Q / W_O offline column permutation (Option C GQA) ──────────────────
+    # For Q-head h = kv_head * gqa_group_size + g, PE s within KV-head:
+    #   old_col = h * head_dim + s * kv_dim_p_pe
+    #   new_col = kv_head * pes_p_kv_head * dim_p_pe + s * dim_p_pe + g * kv_dim_p_pe
+    # W_O permuted symmetrically on the row dimension.
+    W_Q_perm = np.zeros((dim, dim), dtype=np.float16)
+    W_O_perm = np.zeros((dim, dim), dtype=np.float16)
+    for _h in range(n_heads):
+        _kv_head = _h // gqa_group_size
+        _g = _h % gqa_group_size
+        for _s in range(pes_p_kv_head):
+            _old_col = _h * head_dim + _s * kv_dim_p_pe
+            _new_col = _kv_head * pes_p_kv_head * dim_p_pe + _s * dim_p_pe + _g * kv_dim_p_pe
+            W_Q_perm[:, _new_col:_new_col + kv_dim_p_pe] = tensor_q_weight[:, _old_col:_old_col + kv_dim_p_pe]
+            W_O_perm[_new_col:_new_col + kv_dim_p_pe, :] = tensor_o_weight[_old_col:_old_col + kv_dim_p_pe, :]
+
+    # ─── Tile inputs for the PE grid ──────────────────────────────────────────
+    tensor_X = np.tile(X_raw.reshape(P, bsz * dim_p_pe), reps=(1, P))
+    tensor_W = np.tile(W_raw.reshape(P, dim_p_pe), reps=(1, P))
+
+    def tile_weight_row(W, rows, cols):
+        """W: [rows*P, cols*P] → PE tile [P, P, rows*cols]"""
+        r = W.reshape(P, rows, P, cols).transpose(0, 2, 1, 3).reshape(P, P, rows * cols)
+        return r
+
+    Q_tile  = tile_weight_row(W_Q_perm,           dim_p_pe, dim_p_pe)
+    K_tile  = tile_weight_row(tensor_k_weight,    dim_p_pe, kv_dim_p_pe)
+    V_tile  = tile_weight_row(tensor_v_weight,    dim_p_pe, kv_dim_p_pe)
+    O_tile  = tile_weight_row(W_O_perm,           dim_p_pe, dim_p_pe)
+    UP_tile = tile_weight_row(tensor_up_weight,  dim_p_pe, ffn_dim_p_pe)
+    GT_tile = tile_weight_row(tensor_gate_weight, dim_p_pe, ffn_dim_p_pe)
+    DN_tile = tile_weight_row(tensor_down_weight, ffn_dim_p_pe, dim_p_pe)
+
+    # KCache: tensor_XKCache[dim, seq_len]. tile_weight_row gives result[a,b,:] = W[a*rows:,b*cols:].
+    # ROW_MAJOR h2d sends result[py, px, :] to PE(px, py).
+    # So without swap: PE(px,py) gets W[py*dim_p_pe:, px*seq_len_p_pe:] — K-dim indexed by py, seq by px (wrong).
+    # Need: PE(px,py) gets W[px*dim_p_pe:, py*seq_len_p_pe:] — K-dim indexed by px (matches Q), seq by py.
+    # Fix: swapaxes(0,1) so new[py,px,:] = old[px,py,:] = W[px*dim_p_pe:, py*seq_len_p_pe:].
+    KCache_tile = tile_weight_row(tensor_XKCache, kv_dim_p_pe, seq_len_p_pe).swapaxes(0, 1)
+    VCache_tile = tile_weight_row(tensor_XVCache, seq_len_p_pe, kv_dim_p_pe)
+    # ─── Runner ───────────────────────────────────────────────────────────────
     runner = SdkRuntime("out", simfab_numthreads=64, msg_level='INFO')
-
     runner.load()
     runner.run()
-    
-    # -------------------------------------------------------------------------- #
-    # ------------------------------ Get symbols ------------------------------ #
-    # -------------------------------------------------------------------------- #
-    
-    sym_X = runner.get_id("X")
-    sym_W = runner.get_id("W")
-    sym_Q_weight = runner.get_id("Q_weight")
-    sym_K_weight = runner.get_id("K_weight")
-    sym_V_weight = runner.get_id("V_weight")
-    sym_freqs_sin = runner.get_id("freqs_sin")
-    sym_freqs_cos = runner.get_id("freqs_cos")
-    sym_XKCache = runner.get_id("XKCache")
-    sym_XVCache = runner.get_id("XVCache")
-    sym_O_weight = runner.get_id("O_weight")
-    sym_UP_weight = runner.get_id("UP_weight")
+
+    sym_X           = runner.get_id("X")
+    sym_W           = runner.get_id("W")
+    sym_Q_weight    = runner.get_id("Q_weight")
+    sym_K_weight    = runner.get_id("K_weight")
+    sym_V_weight    = runner.get_id("V_weight")
+    sym_freqs_sin   = runner.get_id("freqs_sin")
+    sym_freqs_cos   = runner.get_id("freqs_cos")
+    sym_XKCache     = runner.get_id("XKCache")
+    sym_XVCache     = runner.get_id("XVCache")
+    sym_O_weight    = runner.get_id("O_weight")
+    sym_UP_weight   = runner.get_id("UP_weight")
     sym_GATE_weight = runner.get_id("GATE_weight")
     sym_DOWN_weight = runner.get_id("DOWN_weight")
-    
-    # timer symbol list:
-    symbol_timer_buf = runner.get_id("timer_buf")
-    symbol_timer_ref = runner.get_id("time_ref")
-    sym_debug = runner.get_id("debug")
-    
-    
-    # -------------------------------------------------------------------------- #
-    # ------------------------------ H2D memcpy ------------------------------ #
-    # -------------------------------------------------------------------------- #
-    
-    X_u32 = input_array_to_u32(tensor_X.ravel(), 1, 1)
-    runner.memcpy_h2d(
-        sym_X, X_u32, 0, 0, P, P, bsz*dim_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
-    )
-    
-    W_u32 = input_array_to_u32(tensor_W.ravel(), 1, 1)
-    runner.memcpy_h2d(
-        sym_W, W_u32, 0, 0, P, P, dim_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
-    )
-    
-    # Copy Q_weight
-    Q_reshape = tensor_q_weight.reshape(P, dim_p_pe, P, dim_p_pe)
-    Q_transpose = Q_reshape.transpose(0, 2, 1, 3)
-    Q_reshape = Q_transpose.reshape(P, P, dim_p_pe * dim_p_pe)
-    Q_u32 = input_array_to_u32(Q_reshape.ravel(), 1, 1)
-    runner.memcpy_h2d(
-        sym_Q_weight, Q_u32, 0, 0, P, P, dim_p_pe * dim_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
-    )
-    
-    # Copy K_weight
-    K_reshape = tensor_k_weight.reshape(P, dim_p_pe, P, dim_p_pe)
-    K_transpose = K_reshape.transpose(0, 2, 1, 3)
-    K_reshape = K_transpose.reshape(P, P, dim_p_pe * dim_p_pe)
-    K_u32 = input_array_to_u32(K_reshape.ravel(), 1, 1)
-    runner.memcpy_h2d(
-        sym_K_weight, K_u32, 0, 0, P, P, dim_p_pe * dim_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
-    )
-    
-    # Copy V_weight
-    V_reshape = tensor_v_weight.reshape(P, dim_p_pe, P, dim_p_pe)
-    V_transpose = V_reshape.transpose(0, 2, 1, 3)
-    V_reshape = V_transpose.reshape(P, P, dim_p_pe * dim_p_pe)
-    V_u32 = input_array_to_u32(V_reshape.ravel(), 1, 1)
-    runner.memcpy_h2d(
-        sym_V_weight, V_u32, 0, 0, P, P, dim_p_pe * dim_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
-    )
-    
-    freqs_sin_u32 = input_array_to_u32(tensor_freqs_sin.ravel(), 1, 1)
-    runner.memcpy_h2d(
-        sym_freqs_sin, freqs_sin_u32, 0, 0, P, P, _dim_p_pe//2, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
-    )
-    # Copy freqs_cos
-    freqs_cos_u32 = input_array_to_u32(tensor_freqs_cos.ravel(), 1, 1)
-    runner.memcpy_h2d(
-        sym_freqs_cos, freqs_cos_u32, 0, 0, P, P, _dim_p_pe//2, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
-    )
-    # Copy XKCache
-    XKCache_reshape = tensor_XKCache.reshape(P, dim_p_pe, P, seq_len_p_pe)
-    XKCache_transpose = XKCache_reshape.transpose(0, 2, 1, 3)
-    XKCache_reshape = XKCache_transpose.reshape(P, P, dim_p_pe * seq_len_p_pe)
-    XKCache_u32 = input_array_to_u32(XKCache_reshape.ravel(), 1, 1)
-    runner.memcpy_h2d(
-        sym_XKCache, XKCache_u32, 0, 0, P, P, dim_p_pe * seq_len_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
-    )
-    # Copy XVCache
-    XVCache_reshape = tensor_XVCache.reshape(P, seq_len_p_pe, P, dim_p_pe)
-    XVCache_transpose = XVCache_reshape.transpose(0, 2, 1, 3)
-    XVCache_reshape = XVCache_transpose.reshape(P, P, seq_len_p_pe * dim_p_pe)
-    XVCache_u32 = input_array_to_u32(XVCache_reshape.ravel(), 1, 1)
-    runner.memcpy_h2d(
-        sym_XVCache, XVCache_u32, 0, 0, P, P, seq_len_p_pe * dim_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
-    )
-    # Copy O_weight
-    O_reshape = tensor_o_weight.reshape(P, dim_p_pe, P, dim_p_pe)
-    O_transpose = O_reshape.transpose(0, 2, 1, 3)
-    O_reshape = O_transpose.reshape(P, P, dim_p_pe * dim_p_pe)
-    O_u32 = input_array_to_u32(O_reshape.ravel(), 1, 1)
-    runner.memcpy_h2d(
-        sym_O_weight, O_u32, 0, 0, P, P, dim_p_pe * dim_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
-    )
-    # Copy UP_weight
-    UP_reshape = tensor_up_weight.reshape(P, dim_p_pe, P, ffn_dim_p_pe)
-    UP_transpose = UP_reshape.transpose(0, 2, 1, 3)
-    UP_reshape = UP_transpose.reshape(P, P, dim_p_pe * ffn_dim_p_pe)
-    UP_u32 = input_array_to_u32(UP_reshape.ravel(), 1, 1)
-    runner.memcpy_h2d(
-        sym_UP_weight, UP_u32, 0, 0, P, P, dim_p_pe * ffn_dim_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
-    )
-    # Copy GATE_weight
-    GATE_reshape = tensor_gate_weight.reshape(P, dim_p_pe, P, ffn_dim_p_pe)
-    GATE_transpose = GATE_reshape.transpose(0, 2, 1, 3)
-    GATE_reshape = GATE_transpose.reshape(P, P, dim_p_pe * ffn_dim_p_pe)
-    GATE_u32 = input_array_to_u32(GATE_reshape.ravel(), 1, 1)
-    runner.memcpy_h2d(
-        sym_GATE_weight, GATE_u32, 0, 0, P, P, dim_p_pe * ffn_dim_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
-    )
-    # Copy DOWN_weight
-    DOWN_reshape = tensor_down_weight.reshape(P, ffn_dim_p_pe, P, dim_p_pe)
-    DOWN_transpose = DOWN_reshape.transpose(0, 2, 1, 3)
-    DOWN_reshape = DOWN_transpose.reshape(P, P, ffn_dim_p_pe * dim_p_pe)
-    DOWN_u32 = input_array_to_u32(DOWN_reshape.ravel(), 1, 1)
-    runner.memcpy_h2d(
-        sym_DOWN_weight, DOWN_u32, 0, 0, P, P, ffn_dim_p_pe * dim_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
-    )
-    
-    # -------------------------------------------------------------------------- #
-    # ------------------------------ Run simulator ---------------------------- #
-    # -------------------------------------------------------------------------- #
+    sym_timer_buf   = runner.get_id("timer_buf")
+    sym_time_ref    = runner.get_id("time_ref")
+    sym_debug       = runner.get_id("debug")
+
+    sym_freqs_cos_sym = runner.get_id("freqs_cos")
+    sym_freqs_sin_sym = runner.get_id("freqs_sin")
+
+    if args.validate:
+        sym_QKV_post_proj    = runner.get_id("QKV_post_proj")
+        sym_QKV_post_reduce  = runner.get_id("QKV_post_reduce")
+        sym_QKV_tile         = runner.get_id("QKV_tile")
+        sym_score_post_gemv  = runner.get_id("score_post_gemv")
+        sym_score_post_reduce = runner.get_id("score_post_reduce")
+        sym_score            = runner.get_id("score")
+        sym_output_tile      = runner.get_id("output_tile")
+
+    # ─── H2D memcpy ───────────────────────────────────────────────────────────
+    def h2d(sym, flat_arr, count_per_pe):
+        u32 = input_array_to_u32(flat_arr.ravel(), 1, 1)
+        runner.memcpy_h2d(
+            sym, u32, 0, 0, P, P, count_per_pe,
+            streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
+        )
+
+    h2d(sym_X,    tensor_X,            bsz * dim_p_pe)
+    h2d(sym_W,    tensor_W,            dim_p_pe)
+    h2d(sym_Q_weight,    Q_tile,        dim_p_pe * dim_p_pe)
+    h2d(sym_K_weight,    K_tile,        dim_p_pe * kv_dim_p_pe)
+    h2d(sym_V_weight,    V_tile,        dim_p_pe * kv_dim_p_pe)
+    h2d(sym_freqs_sin,   tensor_freqs_sin, _dim_p_pe // 2)
+    h2d(sym_freqs_cos,   tensor_freqs_cos, _dim_p_pe // 2)
+    h2d(sym_XKCache,     KCache_tile,   kv_dim_p_pe * seq_len_p_pe)
+    h2d(sym_XVCache,     VCache_tile,   seq_len_p_pe * kv_dim_p_pe)
+    h2d(sym_O_weight,    O_tile,        dim_p_pe * dim_p_pe)
+    h2d(sym_UP_weight,   UP_tile,       dim_p_pe * ffn_dim_p_pe)
+    h2d(sym_GATE_weight, GT_tile,       dim_p_pe * ffn_dim_p_pe)
+    h2d(sym_DOWN_weight, DN_tile,       ffn_dim_p_pe * dim_p_pe)
+
+    # ─── Launch ───────────────────────────────────────────────────────────────
     runner.launch("init_task", nonblock=False)
-    
+
     repeat_steps = 1
     warmup_steps = 0
     runner.launch("decode_host", np.int16(repeat_steps), np.int16(warmup_steps), nonblock=False)
-    
-    # -------------------------------------------------------------------------- #
-    # ------------------------------ D2H memcpy ------------------------------ #
-    # -------------------------------------------------------------------------- #
-    
-    debug_1d_u32 = np.zeros(P * bsz * dim, dtype=np.uint32)
+
+    # ─── D2H: debug output ────────────────────────────────────────────────────
+    debug_buf = np.zeros(P * bsz * dim, dtype=np.uint32)
     runner.memcpy_d2h(
-        debug_1d_u32, sym_debug, 0, 0, P, P, bsz * dim_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
+        debug_buf, sym_debug, 0, 0, P, P, bsz * dim_p_pe,
+        streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
     )
-    debug = memcpy_view(debug_1d_u32, np.dtype(np.float16))
-    debug = debug.reshape(P, bsz * dim)
-    
-    # -------------------------------------------------------------------------- #
-    # ------------------------------ Timer Check ------------------------------ #
-    # -------------------------------------------------------------------------- #
-    # Copy back timer_buf from all width x height PEs
-    timer_buf_1d_u32 = np.zeros((P*P*3), dtype=np.uint32)
+    debug_out = memcpy_view(debug_buf, np.dtype(np.float16)).reshape(P, bsz * dim)
+
+    # ─── D2H: freqs readback (always, for debugging RoPE) ────────────────────
+    freqs_cos_grid = d2h(runner, sym_freqs_cos_sym, P, 1, _dim_p_pe // 2, io_dtype, memcpy_order)
+    freqs_sin_grid = d2h(runner, sym_freqs_sin_sym, P, 1, _dim_p_pe // 2, io_dtype, memcpy_order)
+
+    # ─── D2H: intermediate validation buffers ─────────────────────────────────
+    if args.validate:
+        proj_grid         = d2h(runner, sym_QKV_post_proj,    P, bsz, dim_p_pe + 2 * kv_dim_p_pe,  io_dtype, memcpy_order)
+        reduce_grid       = d2h(runner, sym_QKV_post_reduce,  P, bsz, dim_p_pe + 2 * kv_dim_p_pe,  io_dtype, memcpy_order)
+        qkv_grid          = d2h(runner, sym_QKV_tile,         P, bsz, dim_p_pe + 2 * kv_dim_p_pe,  io_dtype, memcpy_order)
+        score_gemv_grid   = d2h(runner, sym_score_post_gemv,  P, bsz, seq_len_p_pe,  io_dtype, memcpy_order)
+        score_reduce_grid = d2h(runner, sym_score_post_reduce, P, bsz, seq_len_p_pe, io_dtype, memcpy_order)
+        score_grid        = d2h(runner, sym_score,             P, bsz, gqa_group_size * seq_len_p_pe,  io_dtype, memcpy_order)
+        out_grid          = d2h(runner, sym_output_tile,       P, bsz, dim_p_pe,      io_dtype, memcpy_order)
+
+    # ─── D2H: timer ───────────────────────────────────────────────────────────
+    timer_buf_1d = np.zeros(P * P * 3, dtype=np.uint32)
     runner.memcpy_d2h(
-        timer_buf_1d_u32, symbol_timer_buf, 0, 0, P, P, 3, streaming=False,
-        data_type=MemcpyDataType.MEMCPY_32BIT, order=MemcpyOrder.ROW_MAJOR, nonblock=False
+        timer_buf_1d, sym_timer_buf, 0, 0, P, P, 3,
+        streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
+        order=MemcpyOrder.ROW_MAJOR, nonblock=False
     )
-    timer_buf_time_hwl = timer_buf_1d_u32.view(np.float32).reshape((P, P, 3))
-    
+    timer_hwl = timer_buf_1d.view(np.float32).reshape((P, P, 3))
+
     runner.stop()
-    
-    # -------------------------------------------------------------------------- #
-    # ------------------------------ Debug Check ------------------------------ #
-    # -------------------------------------------------------------------------- #
-    print("Expected Result:")
-    print(X)
-    print("Simulated Result:")
-    print(debug)
-    
-    debug_mod = debug_util("out")
-    core_offset_x = 4
-    core_offset_y = 1
-    
-    # for px in range(P):
-    #     for py in range(P):
-    #         # trace_output = debug_mod.read_trace(core_offset_x+px, core_offset_y+py, 'debug_main')
-    #         trace_output = debug_mod.read_trace(core_offset_x+px, core_offset_y+py, 'debug_comm')
-    #         print("PE: " + str(px) + ", " + str(py) + " ", end="")
-    #         print(trace_output)
-        
-    # -------------------------------------------------------------------------- #
-    # ------------------------------ Compute time ------------------------------ #
-    # -------------------------------------------------------------------------- #
-    cycles_count = np.zeros((P, P))
+
+    # ─── Timing ───────────────────────────────────────────────────────────────
+    cycles = np.zeros((P, P))
     for pe_x in range(P):
         for pe_y in range(P):
-            cycles_count[pe_y, pe_x] = calculate_cycles(timer_buf_time_hwl[pe_y, pe_x, :])
-    
-    cycles_count_mean = cycles_count.mean()
-    print(f"Host: mean cycles count: {cycles_count_mean/repeat_steps}")
+            cycles[pe_y, pe_x] = calculate_cycles(timer_hwl[pe_y, pe_x, :])
+    print(f"\nHost: mean cycles = {cycles.mean() / repeat_steps:.0f}")
+
+    # ─── Validation ───────────────────────────────────────────────────────────
+    if not args.validate:
+        print("\nDebug output (first row):", debug_out[0, :8], "...")
+        return
+
+    # Reconstruct full-rank tensors from the PE grid
+    X_flat   = X_raw.reshape(bsz, dim)
+    W_norm_v = W_norm_flat                             # [dim]
+
+    ref = compute_reference(
+        X_flat, W_norm_v,
+        W_Q_perm, tensor_k_weight, tensor_v_weight,
+        freqs_cos_ref, freqs_sin_ref,
+        tensor_XKCache, tensor_XVCache,
+        P, n_heads, n_kv_heads, head_dim,
+        dim_p_pe, kv_dim_p_pe, seq_len_p_pe, gqa_group_size, pes_p_kv_head
+    )
+
+    all_ok = True
+
+    # ── Freqs sanity check ─────────────────────────────────────────────────────
+    sep("Freqs sanity check  (verify PE received correct freqs_cos/sin)")
+    for px in range(min(P, 4)):
+        sim_cos = freqs_cos_grid[0, px, :]   # py=0 (all py same)
+        exp_cos = pe_freqs_cos[px, :]
+        sim_sin = freqs_sin_grid[0, px, :]
+        exp_sin = pe_freqs_sin[px, :]
+        cos_ok = float(np.max(np.abs(sim_cos.astype(np.float32) - exp_cos.astype(np.float32)))) < 0.01
+        sin_ok = float(np.max(np.abs(sim_sin.astype(np.float32) - exp_sin.astype(np.float32)))) < 0.01
+        print(f"  PE(px={px})  sim_cos={sim_cos.tolist()}  exp_cos={exp_cos.tolist()}  {'OK' if cos_ok else 'MISMATCH'}")
+        print(f"          sim_sin={sim_sin.tolist()}  exp_sin={exp_sin.tolist()}  {'OK' if sin_ok else 'MISMATCH'}")
+    print()
+
+    # ── Step 2a: Post-projection (local partial GEMV, before Y-reduce) ────────
+    sep("Step 2a — Post-projection  (local partial GEMV per PE, before Y-reduce)")
+    print("  PE(px,py): Q uses W_Q_perm, K/V use compact weights")
+    print(f"  Buffer layout per PE: [Q:{bsz}*{dim_p_pe} | K:{bsz}*{kv_dim_p_pe} | V:{bsz}*{kv_dim_p_pe}]")
+    X_norm = ref['X_norm']   # [bsz, dim]
+    # Build per-PE partial reference [P, P, bsz*(dim_p_pe + 2*kv_dim_p_pe)]
+    proj_ref = np.zeros((P, P, bsz * (dim_p_pe + 2 * kv_dim_p_pe)), dtype=np.float32)
+    for py in range(P):
+        x_row = X_norm[:, py*dim_p_pe:(py+1)*dim_p_pe].astype(np.float32)  # [bsz, dim_p_pe]
+        for px in range(P):
+            q_p = x_row @ W_Q_perm[py*dim_p_pe:(py+1)*dim_p_pe, px*dim_p_pe:(px+1)*dim_p_pe].astype(np.float32)
+            k_p = x_row @ tensor_k_weight[py*dim_p_pe:(py+1)*dim_p_pe, px*kv_dim_p_pe:(px+1)*kv_dim_p_pe].astype(np.float32)
+            v_p = x_row @ tensor_v_weight[py*dim_p_pe:(py+1)*dim_p_pe, px*kv_dim_p_pe:(px+1)*kv_dim_p_pe].astype(np.float32)
+            proj_ref[py, px, :bsz*dim_p_pe] = q_p.ravel()
+            proj_ref[py, px, bsz*dim_p_pe:bsz*(dim_p_pe+kv_dim_p_pe)] = k_p.ravel()
+            proj_ref[py, px, bsz*(dim_p_pe+kv_dim_p_pe):] = v_p.ravel()
+    proj_ref = proj_ref.astype(np.float16)
+    # Show and compare
+    show("Q_sim  PE(0,0) partial", proj_grid[0, 0, :bsz*dim_p_pe].astype(np.float32))
+    show("Q_ref  PE(0,0) partial", proj_ref[0, 0, :bsz*dim_p_pe].astype(np.float32))
+    all_ok &= cmp("Step2a Q-partial  sim vs ref", proj_grid[:,:,:bsz*dim_p_pe], proj_ref[:,:,:bsz*dim_p_pe])
+    all_ok &= cmp("Step2a K-partial  sim vs ref", proj_grid[:,:,bsz*dim_p_pe:bsz*(dim_p_pe+kv_dim_p_pe)], proj_ref[:,:,bsz*dim_p_pe:bsz*(dim_p_pe+kv_dim_p_pe)])
+    all_ok &= cmp("Step2a V-partial  sim vs ref", proj_grid[:,:,bsz*(dim_p_pe+kv_dim_p_pe):], proj_ref[:,:,bsz*(dim_p_pe+kv_dim_p_pe):])
+
+    # ── Step 2b: Post-Y-reduce (full projection, before RoPE) ────────────────
+    sep("Step 2b — Post-Y-reduce  (full Q/K/V, all py identical, before RoPE)")
+    print("  After Y-reduce PE(px,py) holds: Q slice (dim_p_pe) + K/V slices (kv_dim_p_pe each)")
+    print(f"  Buffer layout per PE: [Q:{bsz}*{dim_p_pe} | K:{bsz}*{kv_dim_p_pe} | V:{bsz}*{kv_dim_p_pe}]")
+    Q_full = (X_norm.astype(np.float32) @ W_Q_perm.astype(np.float32)).astype(np.float16)
+    K_full = (X_norm.astype(np.float32) @ tensor_k_weight.astype(np.float32)).astype(np.float16)
+    V_full = (X_norm.astype(np.float32) @ tensor_v_weight.astype(np.float32)).astype(np.float16)
+    reduce_ref = np.zeros((P, P, bsz * (dim_p_pe + 2 * kv_dim_p_pe)), dtype=np.float16)
+    for px in range(P):
+        for py in range(P):
+            reduce_ref[py, px, :bsz*dim_p_pe] = Q_full[:, px*dim_p_pe:(px+1)*dim_p_pe].ravel()
+            reduce_ref[py, px, bsz*dim_p_pe:bsz*(dim_p_pe+kv_dim_p_pe)] = K_full[:, px*kv_dim_p_pe:(px+1)*kv_dim_p_pe].ravel()
+            reduce_ref[py, px, bsz*(dim_p_pe+kv_dim_p_pe):] = V_full[:, px*kv_dim_p_pe:(px+1)*kv_dim_p_pe].ravel()
+    show("Q_sim  PE(0,0) reduced", reduce_grid[0, 0, :bsz*dim_p_pe].astype(np.float32))
+    show("Q_ref  PE(0,0) reduced", reduce_ref[0, 0, :bsz*dim_p_pe].astype(np.float32))
+    all_ok &= cmp("Step2b Q-reduced  sim vs ref", reduce_grid[:,:,:bsz*dim_p_pe], reduce_ref[:,:,:bsz*dim_p_pe])
+    all_ok &= cmp("Step2b K-reduced  sim vs ref", reduce_grid[:,:,bsz*dim_p_pe:bsz*(dim_p_pe+kv_dim_p_pe)], reduce_ref[:,:,bsz*dim_p_pe:bsz*(dim_p_pe+kv_dim_p_pe)])
+    all_ok &= cmp("Step2b V-reduced  sim vs ref", reduce_grid[:,:,bsz*(dim_p_pe+kv_dim_p_pe):], reduce_ref[:,:,bsz*(dim_p_pe+kv_dim_p_pe):])
+
+    show_all("reduce_grid", reduce_grid)
+    # ── Step 2c: Post-RoPE — SKIPPED (RoPE disabled in CSL, strided-DSD bug TBD) ──
+    # Q_sim, K_sim, V_sim = reconstruct_QKV(qkv_grid, bsz, dim_p_pe, P)
+    # all_ok &= cmp("Step2c Q-rope  sim vs ref", Q_sim, ref['Q_rope'])
+    # all_ok &= cmp("Step2c K-rope  sim vs ref", K_sim, ref['K_rope'])
+    # all_ok &= cmp("Step2c V       sim vs ref", V_sim, ref['V'])
+    sep("Step 2c — Post-RoPE  [SKIPPED — RoPE disabled, strided-DSD @fmulh bug TBD]")
+    print("  xq_rope()/xk_rope() are no-ops; QKV_tile == post-reduce Q/K/V")
+
+    if args.simple:
+        xnorm = float(ref['X_norm'][0, 0])
+        q_exp = dim * xnorm
+        print(f"\n  Hand-check: X_norm≈{xnorm:.4f}  Q[any]=dim×X_norm×W_q={dim}×{xnorm:.4f}×{args.fill}={q_exp:.4f}")
+        print(f"  (With cos=1,sin=0: RoPE swaps even/odd; all-ones Q → unchanged)")
+
+    attn_sim             = reconstruct_score(score_grid, bsz, seq_len_p_pe, P, n_heads, n_kv_heads, gqa_group_size)
+    out_sim              = reconstruct_output(out_grid,  bsz, dim_p_pe, P)
+
+    alpha_val = np.float16(1.0 / np.sqrt(head_dim))
+
+    # ── Build per-PE reference for step 5a and 5b ─────────────────────────────
+    # Q after reduce (RoPE disabled) — using permuted W_Q layout
+    Q_perm_full = (ref['X_norm'].astype(np.float32) @ W_Q_perm.astype(np.float32)).astype(np.float16)
+
+    # 5a reference (GQA, g=0 sub-head):
+    #   PE(px, py): score_partial_g0 = Q_perm[g=0 slice at px] @ KCache[px kv-rows, py tokens]
+    #   Q_perm g=0 slice at px = Q_perm_full[:, px*dim_p_pe : px*dim_p_pe + kv_dim_p_pe]
+    #   KCache compact: [kv_dim, seq_len], PE px has rows [px*kv_dim_p_pe:(px+1)*kv_dim_p_pe]
+    score_5a_ref = np.zeros((P, P, bsz * seq_len_p_pe), dtype=np.float16)
+    for py in range(P):
+        for px in range(P):
+            q_g0 = Q_perm_full[:, px * dim_p_pe : px * dim_p_pe + kv_dim_p_pe]  # [bsz, kv_dim_p_pe]
+            k_local = tensor_XKCache[px * kv_dim_p_pe:(px + 1) * kv_dim_p_pe,
+                                     py * seq_len_p_pe:(py + 1) * seq_len_p_pe]  # [kv_dim_p_pe, seq_len_p_pe]
+            partial = (q_g0.astype(np.float32) @ k_local.astype(np.float32)).astype(np.float16)
+            score_5a_ref[py, px, :] = partial.ravel()
+
+    # 5b reference (GQA, g=0 sub-head):
+    #   After KV-head-scoped X-reduce + alpha scale.
+    #   All pes_p_kv_head PEs in the same KV-head block share the same reduced score.
+    score_5b_ref = np.zeros((P, P, bsz * seq_len_p_pe), dtype=np.float16)
+    for py in range(P):
+        for kv_head_i in range(n_kv_heads):
+            kv_score = np.zeros((bsz, seq_len_p_pe), dtype=np.float32)
+            for px in range(kv_head_i * pes_p_kv_head, (kv_head_i + 1) * pes_p_kv_head):
+                kv_score += score_5a_ref[py, px, :].reshape(bsz, seq_len_p_pe).astype(np.float32)
+            kv_score_scaled = (kv_score * float(alpha_val)).astype(np.float16)
+            for px in range(kv_head_i * pes_p_kv_head, (kv_head_i + 1) * pes_p_kv_head):
+                score_5b_ref[py, px, :] = kv_score_scaled.ravel()
+
+    show_all("qkv_grid", qkv_grid)
+    # ── Step 5a: post-GEMV (per-PE partial, before KV-head-scoped reduce) ────────
+    sep("Step 5a — post-score GEMV  (g=0 partial dot product per PE, before KV-head-scoped X-reduce)")
+    print("  PE(py,px): score_g0_partial = Q_perm[g=0 slice at px] @ KCache[px kv-rows, py tokens]")
+    print(f"  KCache compact: [{kv_dim}×{seq_len}], each PE has {kv_dim_p_pe} rows")
+    show_all("score_gemv_sim", score_gemv_grid)
+    show_all("score_5a_ref",   score_5a_ref)
+    # Check representative PE per KV-head (first PE of each KV-head block)
+    for kv_head_i in range(n_kv_heads):
+        px0 = kv_head_i * pes_p_kv_head
+        all_ok &= cmp(f"Step5a score_post_gemv kv_head {kv_head_i} (px={px0})", score_gemv_grid[:, px0, :], score_5a_ref[:, px0, :])
+
+    # ── Step 5b: post-KV-head-scoped-reduce + scale (before softmax) ──────────
+    sep("Step 5b — post KV-head-scoped X-reduce + alpha scale  (g=0 sub-head, before softmax)")
+    print("  All pes_p_kv_head PEs in same KV-head block see identical reduced+scaled score")
+    show_all("score_reduce_sim", score_reduce_grid)
+    show_all("score_5b_ref",     score_5b_ref)
+    for kv_head_i in range(n_kv_heads):
+        px0 = kv_head_i * pes_p_kv_head
+        all_ok &= cmp(f"Step5b score_post_reduce kv_head {kv_head_i} (px={px0})", score_reduce_grid[:, px0, :], score_5b_ref[:, px0, :])
+        # Verify all PEs in KV-head block are identical
+        for px in range(px0 + 1, (kv_head_i + 1) * pes_p_kv_head):
+            max_diff = float(np.max(np.abs(score_reduce_grid[:, px, :].astype(np.float32)
+                                          - score_reduce_grid[:, px0, :].astype(np.float32))))
+            print(f"  [{'OK' if max_diff < 0.01 else 'MISMATCH'}] kv_head {kv_head_i}: PE px={px} identical to px={px0}  max_diff={max_diff:.5f}")
+
+    # ── Step 5c: post-softmax (attn weights) ──────────────────────────────────
+    sep("Step 5c — post-softmax  (final attention weights)")
+    print(f"  [score buffer after softmax_score()]")
+    # attn_sim / ref: [n_heads, bsz, seq_len] — treat as [rows=n_heads, cols=bsz, data=seq_len]
+    show_all("attn sim vs ref", attn_sim, ref_grid=ref['attn_per_head'], row_label="head")
+    for h in range(n_heads):
+        show(f"attn_sim head {h} (from PE)", attn_sim[h, 0])
+        show(f"attn_ref head {h} (numpy)", ref['attn_per_head'][h, 0])
+        all_ok &= cmp(f"Step5c attn head {h}  sim vs ref", attn_sim[h], ref['attn_per_head'][h])
+        s_sim = float(np.sum(attn_sim[h, 0].astype(np.float32)))
+        s_ref = float(np.sum(ref['attn_per_head'][h, 0].astype(np.float32)))
+        print(f"    sum(attn head {h}): sim={s_sim:.6f}  ref={s_ref:.6f}  (expect ≈1.0)")
+
+    if args.simple:
+        alpha_f = 1.0 / np.sqrt(float(head_dim))
+        q_val = float(ref['Q_perm'][0, 0])
+        k_val = float(tensor_XKCache[0, 0])
+        score_exp = pes_p_kv_head * kv_dim_p_pe * q_val * k_val
+        print(f"\n  Hand-check (g=0): score=pes_p_kv_head×kv_dim_p_pe×q×k={pes_p_kv_head}×{kv_dim_p_pe}×{q_val:.4f}×{k_val:.4f}={score_exp:.4f}")
+        print(f"  Scaled: ×{alpha_f:.4f} → {score_exp*alpha_f:.4f}.  Uniform → attn≈1/{seq_len}={1.0/seq_len:.6f}")
+
+    # ── Step 6: output_matvec_mult ───────────────────────────────────────────
+    sep("Step 6 — output_matvec_mult  (gqa_group_size attn@V GEMVs + Y-reduce)")
+    out_ref = reconstruct_output(ref['output_grid'], bsz, dim_p_pe, P)
+    show("output_sim (from PE)", out_sim[0])
+    show("output_ref (numpy)",   out_ref[0])
+    all_ok &= cmp("output  sim vs ref", out_sim, out_ref)
+
+    if args.simple:
+        o_exp = float(args.fill)   # uniform attn × all-fill-V → fill
+        print(f"\n  Hand-check: uniform attn × all-{args.fill} V → output≈{o_exp:.4f}")
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    sep("Validation Summary")
+    print(f"  Config: P={P}  n_heads={n_heads}  n_kv_heads={n_kv_heads}  gqa_group_size={gqa_group_size}")
+    print(f"          pes_p_head={pes_p_head}  pes_p_kv_head={pes_p_kv_head}  dim={dim}  kv_dim={kv_dim}  seq_len={seq_len}")
+    print(f"  simple={args.simple}  fill={args.fill}")
+    print()
+    print(f"  Steps validated (sim = WSE-3 simulator, ref = numpy reference):")
+    print(f"    2a.  QKV post-proj       per-PE partial (W_Q_perm + compact K/V)")
+    print(f"    2b.  QKV post-Y-reduce   full Q/K/V (before RoPE, which is disabled)")
+    print(f"    5a.  Score post-GEMV     g=0 partial per PE, before KV-head-scoped reduce")
+    print(f"    5b.  Score post-reduce   g=0 after KV-head-scoped X-reduce + alpha scale")
+    print(f"    5c.  Attn weights        n_heads={n_heads} heads, post-softmax")
+    print(f"    6.   output_matvec       {gqa_group_size} attn@V GEMVs + Y-reduce")
+    print()
+    print(f"  Overall: {'ALL PASS ✓' if all_ok else 'SOME FAILURES — check output above'}")
+    if not all_ok:
+        print()
+        print("  Tolerance: atol=0.15 (float16 matmul accumulation)")
+        print("  If failures are near the tolerance, check for head boundary routing bugs.")
 
 if __name__ == "__main__":
     main()

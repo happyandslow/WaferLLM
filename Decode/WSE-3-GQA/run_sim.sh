@@ -36,6 +36,7 @@ FABRIC_W=$(($P + 7))
 FABRIC_H=$(($P + 2))
 
 dim_p_pe=$(($DIM / $P))
+kv_dim_p_pe=$((($N_KV_HEADS * $HEAD_DIM) / $P))
 pes_p_head=$(($P / $N_HEADS))
 pes_p_kv_head=$(($P / $N_KV_HEADS))
 head_dim_p_pe=$(($HEAD_DIM / $P))
@@ -60,11 +61,23 @@ echo "PE_NUM_PER_GROUP: $pe_num_p_group"
 echo "ROOT_1ST_PHASE: $root_1st_phase"
 echo "ROOT_2ND_PHASE: $root_2nd_phase"
 
+# Validate: group_num must be a multiple of n_heads (for head-scoped reduce)
+if [ $(( GROUP_NUM % N_HEADS )) -ne 0 ]; then
+    echo "ERROR: group_num ($GROUP_NUM) must be a multiple of n_heads ($N_HEADS)"
+    exit 1
+fi
+
+# Validate: group_num must be a multiple of n_kv_heads (for kv-head-scoped reduce)
+if [ $(( GROUP_NUM % N_KV_HEADS )) -ne 0 ]; then
+    echo "ERROR: group_num ($GROUP_NUM) must be a multiple of n_kv_heads ($N_KV_HEADS)"
+    exit 1
+fi
+
 cslc --arch=wse3 ./src/layout.csl --fabric-dims="$FABRIC_W","$FABRIC_H" --fabric-offsets=4,1 \
-    --params=P:"$P",bsz:"$BSZ",dim_p_pe:"$dim_p_pe",pes_p_head:"$pes_p_head",pes_p_kv_head:"$pes_p_kv_head",head_dim_p_pe:"$head_dim_p_pe",seq_len_p_pe:"$seq_len_p_pe",ffn_dim_p_pe:"$ffn_dim_p_pe",pe_num_p_group:"$pe_num_p_group",root_1st_phase:"$root_1st_phase",root_2nd_phase:"$root_2nd_phase" \
+    --params=P:"$P",bsz:"$BSZ",dim_p_pe:"$dim_p_pe",kv_dim_p_pe:"$kv_dim_p_pe",pes_p_head:"$pes_p_head",pes_p_kv_head:"$pes_p_kv_head",head_dim_p_pe:"$head_dim_p_pe",head_dim:"$HEAD_DIM",seq_len_p_pe:"$seq_len_p_pe",ffn_dim_p_pe:"$ffn_dim_p_pe",pe_num_p_group:"$pe_num_p_group",root_1st_phase:"$root_1st_phase",root_2nd_phase:"$root_2nd_phase" \
     -o out --memcpy --channels 1
 
-cs_python launch_sim.py --config $CONFIG
+cs_python launch_sim.py --config $CONFIG "${@:2}"
 
 rm -rf simfab_traces
 rm -rf wio_flows_tmpdir.*
