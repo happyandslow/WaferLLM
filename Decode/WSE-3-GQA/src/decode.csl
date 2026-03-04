@@ -13,7 +13,8 @@ param pes_p_head: i16;
 param pes_p_kv_head: i16;
 param head_dim_p_pe: i16;
 param head_dim: i16;
-param seq_len_p_pe: i16;
+param max_seq_len_p_pe: i16;
+param prefill_len_p_pe: i16;
 param ffn_dim_p_pe: i16;
 
 const _dim_p_pe: i16 = (dim_p_pe / 2) * 2;
@@ -74,6 +75,10 @@ var quotient_x_in_head: i16 = 0;
 var px_in_kv_head: i16 = 0;
 var quotient_x_in_kv_head: i16 = 0;
 
+// Incremental KV cache state
+var iter_num: i16 = 0;   // tokens cached at this PE (initialized to prefill_len_p_pe in init_task)
+var step: i16 = 0;       // global decode step counter (which PE row caches this token)
+
 const head_dim_f16: f16 = @as(f16, head_dim);
 
 const eps: f16 = 0.000001;
@@ -90,7 +95,7 @@ const layout_mod = @import_module("<layout>");
 const comm_mod = @import_module("comm_lib/comm_pe.csl", @concat_structs(comm_params, .{
     .P = P, .bsz = bsz, .dim_p_pe = dim_p_pe, .kv_dim_p_pe = kv_dim_p_pe,
     .pes_p_head = pes_p_head, .pes_p_kv_head = pes_p_kv_head,
-    .seq_len_p_pe = seq_len_p_pe,
+    .max_seq_len_p_pe = max_seq_len_p_pe,
     .ffn_dim_p_pe = ffn_dim_p_pe,
 
     .pe_num_p_group = pe_num_p_group,
@@ -136,6 +141,8 @@ fn init_task() void {
     quotient_x_in_kv_head = px_in_kv_head / pe_num_p_group;
 
     comm_mod.init();
+
+    iter_num = prefill_len_p_pe;
 
     alpha = 1.0 / @as(f16, math.sqrt(head_dim_f16));
 
@@ -208,8 +215,8 @@ var out_vector_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &dummy, .extent = 1 
 
 var dim_p_pe_dsd_1 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{dim_p_pe} -> dummy[i] });
 var dim_p_pe_dsd_2 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{dim_p_pe} -> dummy[i] });
-var seq_len_p_pe_dsd_1 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe} -> dummy[i] });
-var seq_len_p_pe_dsd_2 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe} -> dummy[i] });
+var max_seq_len_p_pe_dsd_1 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{max_seq_len_p_pe} -> dummy[i] });
+var max_seq_len_p_pe_dsd_2 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{max_seq_len_p_pe} -> dummy[i] });
 var ffn_dim_p_pe_dsd_1 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{ffn_dim_p_pe} -> dummy[i] });
 var ffn_dim_p_pe_dsd_2 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{ffn_dim_p_pe} -> dummy[i] });
 
@@ -234,6 +241,89 @@ fn vecmat_computation() void {
         out_vector_dsd = @increment_dsd_offset(out_vector_dsd, Nt, f16);
     }
 
+}
+
+// -------------------------------------------------------------------------- //
+// -------------- Variable-length GEMV and KV cache write helpers ----------- //
+// -------------------------------------------------------------------------- //
+
+// Copy size elements from src to dest in a 2D-strided pattern (for each of bsz batches).
+// stride_dest_inner / stride_src_inner: element stride within each row (1 = contiguous).
+// stride_dest_outer / stride_src_outer: offset added per batch iteration.
+fn range_copy_2d_strided(dest: *f16, src: *f16, size: u16, stride_dest_outer: i16, stride_dest_inner: i8, stride_src_outer: i16, stride_src_inner: i8) void {
+    var dest_dsd = @get_dsd(mem1d_dsd, .{
+        .base_address = dest,
+        .extent = size,
+        .stride = stride_dest_inner,
+    });
+    var src_dsd = @get_dsd(mem1d_dsd, .{
+        .base_address = src,
+        .extent = size,
+        .stride = stride_src_inner,
+    });
+    for (@range(i16, bsz)) |b| {
+        @load_to_dsr(dest_dsr_1, dest_dsd, .{ .save_address = false });
+        @load_to_dsr(src1_dsr_1, src_dsd, .{ .save_address = false });
+        @fmovh(dest_dsr_1, src1_dsr_1);
+        dest_dsd = @increment_dsd_offset(dest_dsd, stride_dest_outer, f16);
+        src_dsd = @increment_dsd_offset(src_dsd, stride_src_outer, f16);
+    }
+}
+
+// Write new K and V tokens to on-chip cache at position iter_num.
+// Called only by the owning PE (py == step % P). Increments iter_num.
+// K layout: [bsz, kv_dim_p_pe, max_seq_len_p_pe] — write column iter_num via stride max_seq_len_p_pe.
+// V layout: [bsz, max_seq_len_p_pe, kv_dim_p_pe] — write row iter_num contiguously.
+fn process_kv() void {
+    var remain: i16 = step % P;
+    if (py == remain) {
+        range_copy_2d_strided(&XKCache_tile[iter_num], &QKV_tile[bsz * dim_p_pe],
+            kv_dim_p_pe, kv_dim_p_pe * max_seq_len_p_pe, @as(i8, max_seq_len_p_pe), kv_dim_p_pe, 1);
+        range_copy_2d_strided(&XVCache_tile[iter_num * kv_dim_p_pe], &QKV_tile[bsz * (dim_p_pe + kv_dim_p_pe)],
+            kv_dim_p_pe, max_seq_len_p_pe * kv_dim_p_pe, 1, kv_dim_p_pe, 1);
+        iter_num += 1;
+    }
+}
+
+// Variable-length V-side GEMV: Kt and Nt set by caller, right matrix stride = width_right.
+// Used for output GEMV where Kt = iter_num (variable) and Nt = kv_dim_p_pe (fixed).
+fn vecmat_computation_var_right(width_right: i16) void {
+    left_vector_dsd = @set_dsd_length(left_vector_dsd, @bitcast(u16, Kt));
+    right_matrix_dsd = @set_dsd_length(right_matrix_dsd, @bitcast(u16, Nt));
+    out_vector_dsd = @set_dsd_length(out_vector_dsd, @bitcast(u16, Nt));
+    right_matrix_dsd = @set_dsd_base_addr(right_matrix_dsd, ptr_right_matrix);
+
+    for (@range(i16, bsz)) |b| {
+        @load_to_dsr(dest_dsr_1, out_vector_dsd, .{ .save_address = false });
+        @load_to_dsr(src0_dsr_1, out_vector_dsd, .{ .save_address = false });
+        @load_to_dsr(src1_dsr_1, right_matrix_dsd, .{ .save_address = true });
+        @map(gemv_static_step, left_vector_dsd);
+        left_vector_dsd = @increment_dsd_offset(left_vector_dsd, Kt, f16);
+        out_vector_dsd = @increment_dsd_offset(out_vector_dsd, Nt, f16);
+        right_matrix_dsd = @increment_dsd_offset(right_matrix_dsd, width_right, f16);
+    }
+}
+
+// Variable-length K^T GEMV with 2D stride: Nt = iter_num, Kt = kv_dim_p_pe.
+// Each K-dim row is at stride right_stride = max_seq_len_p_pe apart.
+// Used for score GEMV where the number of tokens (Nt) grows over time.
+fn vecmat_computation_var_right_2d_strided(right_stride: i16) void {
+    left_vector_dsd = @set_dsd_length(left_vector_dsd, 1);
+    right_matrix_dsd = @set_dsd_length(right_matrix_dsd, @bitcast(u16, Nt));
+    out_vector_dsd = @set_dsd_length(out_vector_dsd, @bitcast(u16, Nt));
+    right_matrix_dsd = @set_dsd_base_addr(right_matrix_dsd, ptr_right_matrix);
+
+    for (@range(i16, bsz)) |b| {
+        @load_to_dsr(dest_dsr_1, out_vector_dsd, .{ .save_address = false });
+        @load_to_dsr(src0_dsr_1, out_vector_dsd, .{ .save_address = false });
+        for (@range(i16, Kt)) |k| {
+            @load_to_dsr(src1_dsr_1, right_matrix_dsd, .{ .save_address = false });
+            @map(gemv_static_step, left_vector_dsd);
+            left_vector_dsd = @increment_dsd_offset(left_vector_dsd, 1, f16);
+            right_matrix_dsd = @increment_dsd_offset(right_matrix_dsd, right_stride, f16);
+        }
+        out_vector_dsd = @increment_dsd_offset(out_vector_dsd, Nt, f16);
+    }
 }
 
 // -------------------------------------------------------------------------- //
@@ -271,13 +361,13 @@ var freqs_cos: [_dim_p_pe / 2]f16 = @zeros([_dim_p_pe / 2]f16);
 var ptr_freqs_cos: [*]f16 = &freqs_cos;
 var freqs_cos_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &freqs_cos, .extent = _dim_p_pe / 2 });
 
-var XKCache_tile: [kv_dim_p_pe * seq_len_p_pe]f16 = @zeros([kv_dim_p_pe * seq_len_p_pe]f16);
+var XKCache_tile: [kv_dim_p_pe * max_seq_len_p_pe]f16 = @zeros([kv_dim_p_pe * max_seq_len_p_pe]f16);
 var ptr_XKCache: [*]f16 = &XKCache_tile;
-var XKCache_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &XKCache_tile, .extent = kv_dim_p_pe * seq_len_p_pe });
+var XKCache_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &XKCache_tile, .extent = kv_dim_p_pe * max_seq_len_p_pe });
 
-var XVCache_tile: [seq_len_p_pe * kv_dim_p_pe]f16 = @zeros([seq_len_p_pe * kv_dim_p_pe]f16);
+var XVCache_tile: [max_seq_len_p_pe * kv_dim_p_pe]f16 = @zeros([max_seq_len_p_pe * kv_dim_p_pe]f16);
 var ptr_XVCache: [*]f16 = &XVCache_tile;
-var XVCache_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &XVCache_tile, .extent = seq_len_p_pe * kv_dim_p_pe });
+var XVCache_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &XVCache_tile, .extent = max_seq_len_p_pe * kv_dim_p_pe });
 
 var O_weight_tile: [dim_p_pe * dim_p_pe]f16 = @zeros([dim_p_pe * dim_p_pe]f16);
 var ptr_O_weight: [*]f16 = &O_weight_tile;
@@ -370,18 +460,18 @@ var Q_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &QKV_tile, .offset = 0, .exte
 var K_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &QKV_tile, .offset = bsz*dim_p_pe, .extent = bsz*kv_dim_p_pe });
 var V_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &QKV_tile, .offset = bsz*(dim_p_pe + kv_dim_p_pe), .extent = bsz*kv_dim_p_pe });
 
-var score: [gqa_group_size * bsz * seq_len_p_pe]f16 = @zeros([gqa_group_size * bsz * seq_len_p_pe]f16);
+var score: [gqa_group_size * bsz * max_seq_len_p_pe]f16 = @zeros([gqa_group_size * bsz * max_seq_len_p_pe]f16);
 var ptr_score: [*]f16 = &score;
-var score_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &score, .extent = bsz * seq_len_p_pe });
+var score_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &score, .extent = bsz * max_seq_len_p_pe });
 
-var score_tmp: [bsz * seq_len_p_pe]f16 = @zeros([bsz * seq_len_p_pe]f16);
+var score_tmp: [bsz * max_seq_len_p_pe]f16 = @zeros([bsz * max_seq_len_p_pe]f16);
 var ptr_score_tmp: [*]f16 = &score_tmp;
-var score_tmp_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &score_tmp, .extent = bsz * seq_len_p_pe });
+var score_tmp_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &score_tmp, .extent = bsz * max_seq_len_p_pe });
 
-var score_post_gemv:   [bsz * seq_len_p_pe]f16 = @zeros([bsz * seq_len_p_pe]f16);
+var score_post_gemv:   [gqa_group_size * bsz * max_seq_len_p_pe]f16 = @zeros([gqa_group_size * bsz * max_seq_len_p_pe]f16);
 var ptr_score_post_gemv: [*]f16 = &score_post_gemv;
 
-var score_post_reduce: [bsz * seq_len_p_pe]f16 = @zeros([bsz * seq_len_p_pe]f16);
+var score_post_reduce: [gqa_group_size * bsz * max_seq_len_p_pe]f16 = @zeros([gqa_group_size * bsz * max_seq_len_p_pe]f16);
 var ptr_score_post_reduce: [*]f16 = &score_post_reduce;
 
 var output_tile: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
@@ -595,57 +685,50 @@ fn xk_rope() void {
 }
 
 fn score_matvec_mult() void {
-    // Zero all sub-head score entries
-    for (@range(i16, gqa_group_size * bsz * seq_len_p_pe)) |i| { score[i] = 0.0; }
+    // Zero full max-capacity score buffer, then use iter_num-length GEMVs.
+    score_dsd = @set_dsd_length(score_dsd, @bitcast(u16, gqa_group_size * bsz * max_seq_len_p_pe));
+    score_dsd = @set_dsd_base_addr(score_dsd, ptr_score);
+    @fmovh(score_dsd, 0.0);
 
     ptr_right_matrix = &XKCache_tile;
     Kt = kv_dim_p_pe;
-    Nt = seq_len_p_pe;
+    Nt = iter_num;  // variable: grows as tokens accumulate
 
-    // Phase 1: all gqa_group_size GEMVs — Q[g] @ K^T → score[g]  (no sync)
-    // vecmat_computation() advances left_vector_dsd by bsz*Kt and out_vector_dsd by bsz*Nt per call.
+    // Phase 1: all gqa_group_size GEMVs — Q[g] @ K^T[:, :iter_num] → score[g]
+    // vecmat_computation_var_right_2d_strided uses K layout [kv_dim_p_pe, max_seq_len_p_pe]
+    // with stride max_seq_len_p_pe between rows.
     left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, &QKV_tile);
     out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_score);
     for (@range(i16, gqa_group_size)) |_| {
-        vecmat_computation();
+        vecmat_computation_var_right_2d_strided(max_seq_len_p_pe);
     }
 
-    // Snapshot 5a: after all GEMVs, before reduce (captures g=0 section)
-    for (@range(i16, bsz * seq_len_p_pe)) |i| { score_post_gemv[i] = score[i]; }
+    // Snapshot 5a: copy full score buffer (groups at max_seq_len_p_pe stride; unused slots are zero)
+    for (@range(i16, gqa_group_size * bsz * max_seq_len_p_pe)) |i| { score_post_gemv[i] = score[i]; }
 
-    // Phase 2: ONE batched KV-head-scoped X-reduce over all gqa_group_size groups
-    // (replaces gqa_group_size separate reduces)
-    comm_mod.all_reduce_bsz_g_seq_len_kv_head_scoped(px_in_kv_head, quotient_x_in_kv_head, remainder_x, ptr_score);
-    // simprint.print_string(" score_dsd post all reduce: ");
-    // score_dsd = @set_dsd_base_addr(score_dsd, ptr_score);
-    simprint_pe_coords_dsd(score_dsd);
+    // Phase 2: ONE batched variable-length KV-head-scoped X-reduce over all gqa_group_size groups
+    comm_mod.all_reduce_bsz_g_var_seq_len_kv_head_scoped(px_in_kv_head, quotient_x_in_kv_head, remainder_x, ptr_score, iter_num);
 
-    // Phase 3: alpha scale all groups  (no sync)
+    // Phase 3: alpha scale all groups  (no sync), each group has bsz*iter_num elements
+    score_dsd = @set_dsd_length(score_dsd, @bitcast(u16, bsz * iter_num));
     score_dsd = @set_dsd_base_addr(score_dsd, ptr_score);
     for (@range(i16, gqa_group_size)) |_| {
         @load_to_dsr(dest_dsr_1, score_dsd);
         @load_to_dsr(src0_dsr_1, score_dsd);
         @fmulh(dest_dsr_1, src0_dsr_1, alpha);
-        score_dsd = @increment_dsd_offset(score_dsd, bsz * seq_len_p_pe, f16);
+        score_dsd = @increment_dsd_offset(score_dsd, bsz * iter_num, f16);
     }
-    score_dsd = @set_dsd_base_addr(score_dsd, ptr_score);
-    // simprint.print_string(" score_dsd post alpha scale: ");
-    // simprint_pe_coords_dsd(score_dsd);
-    // simprint.print_string(" alpha: ");
-    // simprint.print_f16(alpha);
-    // simprint.print_string(" head_dim_p_pe: ");
-    // simprint.print_u16_decimal(@as(u16, head_dim_p_pe));
 
-    // Snapshot 5b: after reduce + alpha scale (captures g=0 section)
-    for (@range(i16, bsz * seq_len_p_pe)) |i| { score_post_reduce[i] = score[i]; }
+    // Snapshot 5b: copy full score buffer (groups at max_seq_len_p_pe stride; unused slots are zero)
+    for (@range(i16, gqa_group_size * bsz * max_seq_len_p_pe)) |i| { score_post_reduce[i] = score[i]; }
 }
 
 fn softmax_score() void {
     simprint.print_string("score_dsd pre softmax: ");
     simprint_pe_coords_dsd(score_dsd);
 
-    seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score);
-    @load_to_dsr(src1_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
+    max_seq_len_p_pe_dsd_1 = @set_dsd_base_addr(max_seq_len_p_pe_dsd_1, ptr_score);
+    @load_to_dsr(src1_dsr_1, max_seq_len_p_pe_dsd_1, .{ .save_address = true });
     for (@range(i16, bsz)) |b| {
         max = 0.0;
         @fmaxh(ptr_max, max, src1_dsr_1);
@@ -657,10 +740,10 @@ fn softmax_score() void {
     simprint.print_string(" post all reduce max: ");
     simprint.print_f16(local_max[0]);
 
-    seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score_tmp);
-    seq_len_p_pe_dsd_2 = @set_dsd_base_addr(seq_len_p_pe_dsd_2, ptr_score);
-    @load_to_dsr(dest_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
-    @load_to_dsr(src0_dsr_1, seq_len_p_pe_dsd_2, .{ .save_address = true });
+    max_seq_len_p_pe_dsd_1 = @set_dsd_base_addr(max_seq_len_p_pe_dsd_1, ptr_score_tmp);
+    max_seq_len_p_pe_dsd_2 = @set_dsd_base_addr(max_seq_len_p_pe_dsd_2, ptr_score);
+    @load_to_dsr(dest_dsr_1, max_seq_len_p_pe_dsd_1, .{ .save_address = true });
+    @load_to_dsr(src0_dsr_1, max_seq_len_p_pe_dsd_2, .{ .save_address = true });
     @map(fsubh_func, local_max_dsd);
 
     // simprint.print_string(" score_dsd pre exp: ");
@@ -668,12 +751,12 @@ fn softmax_score() void {
     @map(fast_exp, score_tmp_dsd, score_dsd);
     simprint.print_string(" score_dsd post exp: ");
     simprint_pe_coords_dsd(score_dsd);
-    // for (@range(i16, bsz*seq_len_p_pe)) |i| {
+    // for (@range(i16, bsz*max_seq_len_p_pe)) |i| {
     //     score[i] = fast_exp(score_tmp[i]);
     // }
 
-    seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score);
-    @load_to_dsr(src1_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
+    max_seq_len_p_pe_dsd_1 = @set_dsd_base_addr(max_seq_len_p_pe_dsd_1, ptr_score);
+    @load_to_dsr(src1_dsr_1, max_seq_len_p_pe_dsd_1, .{ .save_address = true });
     for (@range(i16, bsz)) |b| {
         sum = 0.0;
         @faddh(ptr_sum, sum, src1_dsr_1);
@@ -685,107 +768,113 @@ fn softmax_score() void {
     simprint.print_string(" post all reduce sum: ");
     simprint.print_f16(local_sum[0]);
 
-    seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score);
-    @load_to_dsr(dest_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
-    @load_to_dsr(src0_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
+    max_seq_len_p_pe_dsd_1 = @set_dsd_base_addr(max_seq_len_p_pe_dsd_1, ptr_score);
+    @load_to_dsr(dest_dsr_1, max_seq_len_p_pe_dsd_1, .{ .save_address = true });
+    @load_to_dsr(src0_dsr_1, max_seq_len_p_pe_dsd_1, .{ .save_address = true });
     @map(fmulh_softmax_func, local_sum_dsd);
     simprint.print_string(" score_dsd post softmax: ");
     simprint_pe_coords_dsd(score_dsd);
 }
 
 fn softmax_score_all_groups() void {
+
+    // Set iter_num length on the score-row DSDs used throughout this function.
+    max_seq_len_p_pe_dsd_1 = @set_dsd_length(max_seq_len_p_pe_dsd_1, @bitcast(u16, iter_num));
+    max_seq_len_p_pe_dsd_2 = @set_dsd_length(max_seq_len_p_pe_dsd_2, @bitcast(u16, iter_num));
+    score_tmp_dsd = @set_dsd_length(score_tmp_dsd, @bitcast(u16, bsz * iter_num * gqa_group_size));
+
     // Step 1: local max for each group g, batch b → local_max_g[g*bsz + b]
-    // Set base once to &score (whole-array ptr); save_address=true auto-advances by bsz*seq_len_p_pe per group.
-    seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score);
+    // Set base once to &score; save_address=true auto-advances by bsz*iter_num per group.
+    max_seq_len_p_pe_dsd_1 = @set_dsd_base_addr(max_seq_len_p_pe_dsd_1, ptr_score);
     for (@range(i16, gqa_group_size)) |g| {
-        @load_to_dsr(src1_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
+        @load_to_dsr(src1_dsr_1, max_seq_len_p_pe_dsd_1, .{ .save_address = true });
         for (@range(i16, bsz)) |b| {
             max = 0.0;
             @fmaxh(ptr_max, max, src1_dsr_1);
             local_max_g[g * bsz + b] = max;
         }
-        // save_address=true: seq_len_p_pe_dsd_1 auto-advances to next group after inner loop
     }
 
     // Step 2: ONE Y-reduce-max over gqa_group_size * bsz scalars
     comm_mod.all_reduceMax_bsz_g(py, quotient_y, remainder_y, &local_max_g);
-    simprint.print_string(" local_max_g post all reduce: ");
+    simprint.print_string(" post all reduce max: ");
     simprint_pe_coords_dsd(local_max_g_dsd);
+
+    score_dsd = @set_dsd_length(score_dsd, @bitcast(u16, bsz * max_seq_len_p_pe * gqa_group_size));
+    score_dsd = @set_dsd_base_addr(score_dsd, ptr_score);
+    simprint.print_string(" score_dsd end softmax_score_all_groups: ");
+    simprint_pe_coords_dsd(score_dsd);
+    
     // Step 3: subtract global max + apply exp → score[g] in place (no sync)
-    // seq_len_p_pe_dsd_2 set once; auto-advances via save_address=true.
-    // seq_len_p_pe_dsd_1 reset inside loop (scratch buffer reused each group).
-    // score_dsd and local_max_dsd do NOT auto-advance (@map, not DSR); use @increment_dsd_offset.
-    seq_len_p_pe_dsd_2 = @set_dsd_base_addr(seq_len_p_pe_dsd_2, ptr_score);
+    max_seq_len_p_pe_dsd_2 = @set_dsd_base_addr(max_seq_len_p_pe_dsd_2, ptr_score);
+    max_seq_len_p_pe_dsd_1 = @set_dsd_base_addr(max_seq_len_p_pe_dsd_1, ptr_score_tmp);
+    score_dsd = @set_dsd_length(score_dsd, @bitcast(u16, bsz * iter_num));
     score_dsd = @set_dsd_base_addr(score_dsd, ptr_score);
     local_max_dsd = @set_dsd_base_addr(local_max_dsd, &local_max_g);
     for (@range(i16, gqa_group_size)) |_| {
-        seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score_tmp);
-        @load_to_dsr(dest_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
-        @load_to_dsr(src0_dsr_1, seq_len_p_pe_dsd_2, .{ .save_address = true });
+        @load_to_dsr(dest_dsr_1, max_seq_len_p_pe_dsd_1, .{ .save_address = true });
+        @load_to_dsr(src0_dsr_1, max_seq_len_p_pe_dsd_2, .{ .save_address = true });
         @map(fsubh_func, local_max_dsd);
         @map(fast_exp, score_tmp_dsd, score_dsd);
-        score_dsd = @increment_dsd_offset(score_dsd, bsz * seq_len_p_pe, f16);
-        // score_tmp_dsd is NOT incremented: scratch buffer always rewritten at position 0
+        score_dsd = @increment_dsd_offset(score_dsd, bsz * iter_num, f16);
         local_max_dsd = @increment_dsd_offset(local_max_dsd, bsz, f16);
-        // seq_len_p_pe_dsd_2 auto-advances to next group via save_address=true
+        max_seq_len_p_pe_dsd_1 = @increment_dsd_offset(max_seq_len_p_pe_dsd_1, bsz * iter_num, f16);   
+        max_seq_len_p_pe_dsd_2 = @increment_dsd_offset(max_seq_len_p_pe_dsd_2, bsz * iter_num, f16);
     }
-
+    
+    score_dsd = @set_dsd_length(score_dsd, @bitcast(u16, bsz * max_seq_len_p_pe * gqa_group_size));
     score_dsd = @set_dsd_base_addr(score_dsd, ptr_score);
-    score_dsd = @set_dsd_length(score_dsd, @bitcast(u16, gqa_group_size));
-    simprint.print_string(" score_dsd post exp: ");
+    simprint.print_string(" score_dsd pre sum: ");
     simprint_pe_coords_dsd(score_dsd);
 
     // Step 4: local sum for each group g, batch b → local_sum_g[g*bsz + b]
-    // Same pattern as Step 1: set base once, auto-advance per group.
-    seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score);
+    max_seq_len_p_pe_dsd_1 = @set_dsd_base_addr(max_seq_len_p_pe_dsd_1, ptr_score);
+    max_seq_len_p_pe_dsd_1 = @set_dsd_length(max_seq_len_p_pe_dsd_1, @bitcast(u16,  iter_num));
     for (@range(i16, gqa_group_size)) |g| {
-        @load_to_dsr(src1_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
         for (@range(i16, bsz)) |b| {
             sum = 0.0;
+            @load_to_dsr(src1_dsr_1, max_seq_len_p_pe_dsd_1, .{ .save_address = true });
+            // for (@range(i16, iter_num)) |i| {
             @faddh(ptr_sum, sum, src1_dsr_1);
+            // }
             local_sum_g[g * bsz + b] = sum;
         }
-        // save_address=true: seq_len_p_pe_dsd_1 auto-advances to next group after inner loop
+        max_seq_len_p_pe_dsd_1 = @increment_dsd_offset(max_seq_len_p_pe_dsd_1, bsz * iter_num, f16);
     }
-    simprint.print_string(" score_dsd post exp: ");
-    simprint_pe_coords_dsd(score_dsd);
 
+    simprint.print_string(" pre all reduce sum: ");
+    simprint_pe_coords_dsd(local_sum_g_dsd);
     // Step 5: ONE Y-reduce-sum over gqa_group_size * bsz scalars
     comm_mod.all_reduce_bsz_g(py, quotient_y, remainder_y, &local_sum_g);
-    simprint.print_string(" local_sum_g post all reduce: ");
+    simprint.print_string(" post all reduce sum: ");
     simprint_pe_coords_dsd(local_sum_g_dsd);
-    // Step 6: divide each score[g] by its global sum (no sync)
-    // seq_len_p_pe_dsd_1 set once; auto-advances via save_address=true (both dest and src0 DSRs).
-    // local_sum_dsd does NOT auto-advance (@map); use @increment_dsd_offset.
-    seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score);
+    // Step 6: divide each score[g] by its global sum (explicit DSD increment between groups)
+    max_seq_len_p_pe_dsd_1 = @set_dsd_base_addr(max_seq_len_p_pe_dsd_1, ptr_score);
     local_sum_dsd = @set_dsd_base_addr(local_sum_dsd, &local_sum_g);
     for (@range(i16, gqa_group_size)) |_| {
-        simprint.print_string(" seq_len_p_pe_dsd_1: ");
-        simprint_pe_coords_dsd(seq_len_p_pe_dsd_1);
-        @load_to_dsr(dest_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
-        @load_to_dsr(src0_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
+        @load_to_dsr(dest_dsr_1, max_seq_len_p_pe_dsd_1, .{ .save_address = false });
+        @load_to_dsr(src0_dsr_1, max_seq_len_p_pe_dsd_1, .{ .save_address = false });
         @map(fmulh_softmax_func, local_sum_dsd);
         local_sum_dsd = @increment_dsd_offset(local_sum_dsd, bsz, f16);
-        seq_len_p_pe_dsd_1 = @increment_dsd_offset(seq_len_p_pe_dsd_1, bsz * seq_len_p_pe, f16);
+        max_seq_len_p_pe_dsd_1 = @increment_dsd_offset(max_seq_len_p_pe_dsd_1, bsz * iter_num, f16);
     }
-    simprint.print_string(" score_dsd after fmulh: ");
-    simprint_pe_coords_dsd(score_dsd);
     // Restore local_max_dsd and local_sum_dsd base addresses for other callers
     local_max_dsd = @set_dsd_base_addr(local_max_dsd, ptr_local_max);
     local_sum_dsd = @set_dsd_base_addr(local_sum_dsd, ptr_local_sum);
+
 }
 
 fn output_matvec_mult_all_groups() void {
-    // Set bases once using whole-array pointers (valid for @set_dsd_base_addr).
-    // vecmat_computation() advances left_vector_dsd by bsz*Kt and out_vector_dsd by bsz*Nt
-    // per call via its internal @increment_dsd_offset calls — exactly the per-group stride.
+    // gqa_group_size output GEMVs: attn[g][b, :iter_num] @ V[:iter_num, :kv_dim_p_pe]
+    // V layout: [bsz, max_seq_len_p_pe, kv_dim_p_pe] — each token row is kv_dim_p_pe wide.
+    // vecmat_computation_var_right uses Kt=iter_num, Nt=kv_dim_p_pe, right stride = kv_dim_p_pe * max_seq_len_p_pe.
     left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_score);
     out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_output);
     ptr_right_matrix = &XVCache_tile;
-    Kt = seq_len_p_pe;
+    Kt = iter_num;  // variable: current sequence length
     Nt = kv_dim_p_pe;
     for (@range(i16, gqa_group_size)) |_| {
-        vecmat_computation();
+        vecmat_computation_var_right(kv_dim_p_pe * max_seq_len_p_pe);
     }
     // Y-reduce is deferred: done once after all gqa_group_size output GEMVs (caller's responsibility)
 }
@@ -839,9 +928,9 @@ fn rmsnorm_z() void {
         @fmulh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
     }
 
-    seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_z_norm);
-    @load_to_dsr(dest_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
-    @load_to_dsr(src0_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
+    max_seq_len_p_pe_dsd_1 = @set_dsd_base_addr(max_seq_len_p_pe_dsd_1, ptr_z_norm);
+    @load_to_dsr(dest_dsr_1, max_seq_len_p_pe_dsd_1, .{ .save_address = true });
+    @load_to_dsr(src0_dsr_1, max_seq_len_p_pe_dsd_1, .{ .save_address = true });
     @map(fmulh_norm_func, local_sum_dsd);
 }
 
@@ -945,6 +1034,8 @@ fn decode_struct() void {
     // xq_rope();  // TODO: RoPE disabled — strided-DSD @fmulh bug under investigation
     // xk_rope();
 
+    process_kv();  // write K,V to on-chip cache at iter_num (only py == step % P writes)
+
     score_matvec_mult();  // gqa_group_size GEMVs + kv-head-scoped reduces inside
 
     comm_mod.reconfig_allreduce_axis(1);
@@ -980,6 +1071,8 @@ fn decode_struct() void {
     ffn_residual_add();
 
     comm_mod.reconfig_allreduce_axis(1);
+
+    step += 1;
 
     decode_entry();
 }
@@ -1096,8 +1189,8 @@ comptime {
     @export_symbol(ptr_QKV_post_proj,   "QKV_post_proj");     // after projection, before Y-reduce
     @export_symbol(ptr_QKV_post_reduce, "QKV_post_reduce");   // after Y-reduce, before RoPE
     @export_symbol(ptr_QKV_tile, "QKV_tile");                 // post-RoPE Q/K/V  [bsz*(dim_p_pe+2*kv_dim_p_pe)]
-    @export_symbol(ptr_score_post_gemv,   "score_post_gemv"); // after GEMV, before head reduce [bsz*seq_len_p_pe]
-    @export_symbol(ptr_score_post_reduce, "score_post_reduce"); // after reduce+alpha, before softmax [bsz*seq_len_p_pe]
-    @export_symbol(ptr_score, "score");                       // post-softmax attn [bsz*seq_len_p_pe]
+    @export_symbol(ptr_score_post_gemv,   "score_post_gemv"); // after GEMV, before head reduce [bsz*max_seq_len_p_pe]
+    @export_symbol(ptr_score_post_reduce, "score_post_reduce"); // after reduce+alpha, before softmax [bsz*max_seq_len_p_pe]
+    @export_symbol(ptr_score, "score");                       // post-softmax attn [bsz*max_seq_len_p_pe]
     @export_symbol(ptr_output, "output_tile");                // post-output-matmul [bsz*dim_p_pe]
 }

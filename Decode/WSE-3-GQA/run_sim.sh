@@ -17,7 +17,8 @@ if [ -f $CONFIG ]; then
     N_HEADS=$(jq -r '.n_heads' $CONFIG)
     N_KV_HEADS=$(jq -r '.n_kv_heads' $CONFIG)
     HEAD_DIM=$(jq -r '.head_dim' $CONFIG)
-    SEQ_LEN=$(jq -r '.seq_len' $CONFIG)
+    MAX_SEQ_LEN=$(jq -r '.max_seq_len' $CONFIG)
+    PREFILL_LEN=$(jq -r '.prefill_len' $CONFIG)
     FFN_DIM=$(jq -r '.ffn_dim' $CONFIG)
 else
     echo "Use default test values."
@@ -28,7 +29,8 @@ else
     N_HEADS=1
     N_KV_HEADS=1
     HEAD_DIM=64
-    SEQ_LEN=64
+    MAX_SEQ_LEN=128
+    PREFILL_LEN=64
     FFN_DIM=64
 fi
 
@@ -40,7 +42,8 @@ kv_dim_p_pe=$((($N_KV_HEADS * $HEAD_DIM) / $P))
 pes_p_head=$(($P / $N_HEADS))
 pes_p_kv_head=$(($P / $N_KV_HEADS))
 head_dim_p_pe=$(($HEAD_DIM / $P))
-seq_len_p_pe=$(($SEQ_LEN / $P))
+max_seq_len_p_pe=$(($MAX_SEQ_LEN / $P))
+prefill_len_p_pe=$(($PREFILL_LEN / $P))
 ffn_dim_p_pe=$(($FFN_DIM / $P))
 pe_num_p_group=$(($P / $GROUP_NUM))
 
@@ -53,7 +56,8 @@ echo "DIM: $DIM"
 echo "N_HEADS: $N_HEADS"
 echo "N_KV_HEADS: $N_KV_HEADS"
 echo "HEAD_DIM: $HEAD_DIM"
-echo "SEQ_LEN: $SEQ_LEN"
+echo "MAX_SEQ_LEN: $MAX_SEQ_LEN"
+echo "PREFILL_LEN: $PREFILL_LEN"
 echo "FFN_DIM: $FFN_DIM"
 
 echo "GROUP_NUM: $GROUP_NUM"
@@ -73,8 +77,20 @@ if [ $(( GROUP_NUM % N_KV_HEADS )) -ne 0 ]; then
     exit 1
 fi
 
+# Validate: prefill_len must be divisible by P
+if [ $(( PREFILL_LEN % P )) -ne 0 ]; then
+    echo "ERROR: prefill_len ($PREFILL_LEN) must be divisible by P ($P)"
+    exit 1
+fi
+
+# Validate: max_seq_len must be divisible by P and >= prefill_len
+if [ $(( MAX_SEQ_LEN % P )) -ne 0 ]; then
+    echo "ERROR: max_seq_len ($MAX_SEQ_LEN) must be divisible by P ($P)"
+    exit 1
+fi
+
 cslc --arch=wse3 ./src/layout.csl --fabric-dims="$FABRIC_W","$FABRIC_H" --fabric-offsets=4,1 \
-    --params=P:"$P",bsz:"$BSZ",dim_p_pe:"$dim_p_pe",kv_dim_p_pe:"$kv_dim_p_pe",pes_p_head:"$pes_p_head",pes_p_kv_head:"$pes_p_kv_head",head_dim_p_pe:"$head_dim_p_pe",head_dim:"$HEAD_DIM",seq_len_p_pe:"$seq_len_p_pe",ffn_dim_p_pe:"$ffn_dim_p_pe",pe_num_p_group:"$pe_num_p_group",root_1st_phase:"$root_1st_phase",root_2nd_phase:"$root_2nd_phase" \
+    --params=P:"$P",bsz:"$BSZ",dim_p_pe:"$dim_p_pe",kv_dim_p_pe:"$kv_dim_p_pe",pes_p_head:"$pes_p_head",pes_p_kv_head:"$pes_p_kv_head",head_dim_p_pe:"$head_dim_p_pe",head_dim:"$HEAD_DIM",max_seq_len_p_pe:"$max_seq_len_p_pe",prefill_len_p_pe:"$prefill_len_p_pe",ffn_dim_p_pe:"$ffn_dim_p_pe",pe_num_p_group:"$pe_num_p_group",root_1st_phase:"$root_1st_phase",root_2nd_phase:"$root_2nd_phase" \
     -o out --memcpy --channels 1
 
 cs_python launch_sim.py --config $CONFIG "${@:2}"

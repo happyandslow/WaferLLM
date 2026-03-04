@@ -61,16 +61,19 @@ def softmax_csl(score):
 
 def compute_reference(X, W_norm, W_Q_perm, W_K, W_V, freqs_cos, freqs_sin,
                       XKCache, XVCache, P, n_heads, n_kv_heads, head_dim,
-                      dim_p_pe, kv_dim_p_pe, seq_len_p_pe, gqa_group_size, pes_p_kv_head):
+                      dim_p_pe, kv_dim_p_pe, max_seq_len_p_pe, prefill_len_p_pe,
+                      gqa_group_size, pes_p_kv_head):
     """
-    Compute expected values at each validation step, matching CSL GQA Phase 2 (Option C) exactly.
-    W_Q_perm: permuted Q weight [dim, dim].  W_K, W_V: compact [dim, kv_dim].
-    XKCache: compact [kv_dim, seq_len].  XVCache: compact [seq_len, kv_dim].
-    Returns a dict with keys: X_norm, Q_perm, K, V, attn_per_head, output_grid
+    Phase 3 reference for decode step 0.
+    XKCache: [kv_dim, max_seq_len] — only cols 0..prefill_len-1 valid (interleaved).
+    XVCache: [max_seq_len, kv_dim] — only rows 0..prefill_len-1 valid (interleaved).
+    Interleaved layout: XKCache[:, t] is for global token t (PE py=t%P, slot t//P).
+    After process_kv (step=0): PE py=0 adds new K/V at slot prefill_len_p_pe.
+    Returns dict with iter_num_per_pe, attn_per_head, output_grid, etc.
     """
     kv_dim = n_kv_heads * head_dim
+    prefill_len = P * prefill_len_p_pe
     alpha = np.float16(1.0 / np.sqrt(head_dim))
-    seq_len = XKCache.shape[1]
     bsz = X.shape[0]
 
     # Step 1: RMSNorm disabled
@@ -78,54 +81,70 @@ def compute_reference(X, W_norm, W_Q_perm, W_K, W_V, freqs_cos, freqs_sin,
 
     # Step 2: Projections using permuted W_Q and compact W_K/V
     Q_perm = (X_norm.astype(np.float32) @ W_Q_perm.astype(np.float32)).astype(np.float16)  # [bsz, dim]
-    K = (X_norm.astype(np.float32) @ W_K.astype(np.float32)).astype(np.float16)             # [bsz, kv_dim]
-    V = (X_norm.astype(np.float32) @ W_V.astype(np.float32)).astype(np.float16)             # [bsz, kv_dim]
+    K_new = (X_norm.astype(np.float32) @ W_K.astype(np.float32)).astype(np.float16)         # [bsz, kv_dim]
+    V_new = (X_norm.astype(np.float32) @ W_V.astype(np.float32)).astype(np.float16)         # [bsz, kv_dim]
 
     # Step 3: RoPE disabled
     Q_rope = Q_perm
-    K_rope = K
+    K_rope = K_new
 
-    # Step 4+5: Attention per Q-head, KV-head-scoped reduce
-    # For head h = kv_head * gqa_group_size + g:
-    #   Q_h is reconstructed from Q_perm by collecting kv_dim_p_pe-wide slices
-    #   across all pes_p_kv_head PEs in the KV-head block for group g.
+    # After process_kv() at step=0: PE py=0 writes new K/V at slot prefill_len_p_pe.
+    # iter_num[py=0] = prefill_len_p_pe + 1; iter_num[py>0] = prefill_len_p_pe.
+    iter_num_per_pe = np.full(P, prefill_len_p_pe, dtype=int)
+    iter_num_per_pe[0] += 1  # PE py=0 increments after writing new token
+
+    # Build extended K/V cache: K_ext[kv_dim, prefill_len+1], V_ext[prefill_len+1, kv_dim]
+    # K_ext[:, t] = K for global token t.
+    # Global token t → PE py=t%P, slot t//P.
+    # XKCache[:, t] for t < prefill_len (interleaved, so XKCache[:, t] = K for token t).
+    # New token at t=prefill_len comes from K_new.
+    K_ext = np.zeros((kv_dim, prefill_len + 1), dtype=np.float32)
+    K_ext[:, :prefill_len] = XKCache[:, :prefill_len].astype(np.float32)
+    K_ext[:, prefill_len] = K_new[0, :].astype(np.float32)  # bsz index 0 (first batch)
+
+    V_ext = np.zeros((prefill_len + 1, kv_dim), dtype=np.float32)
+    V_ext[:prefill_len, :] = XVCache[:prefill_len, :].astype(np.float32)
+    V_ext[prefill_len, :] = V_new[0, :].astype(np.float32)
+
+    seq_len = prefill_len + 1  # total tokens for step 0
+
+    # Step 4+5: Attention per Q-head over seq_len tokens (same logic as Phase 2)
     score_per_head = np.zeros((n_heads, bsz, seq_len), dtype=np.float32)
     for h in range(n_heads):
         kv_head = h // gqa_group_size
         g = h % gqa_group_size
-        # Reconstruct Q_h from permuted Q layout
         Q_h = np.zeros((bsz, head_dim), dtype=np.float32)
         for s in range(pes_p_kv_head):
             px = kv_head * pes_p_kv_head + s
             col_start = px * dim_p_pe + g * kv_dim_p_pe
             Q_h[:, s * kv_dim_p_pe:(s + 1) * kv_dim_p_pe] = Q_perm[:, col_start:col_start + kv_dim_p_pe].astype(np.float32)
-        # K for this KV-head
-        K_kv = XKCache[kv_head * head_dim:(kv_head + 1) * head_dim, :]  # [head_dim, seq_len]
-        score_per_head[h] = Q_h @ K_kv.astype(np.float32)
+        K_kv = K_ext[kv_head * head_dim:(kv_head + 1) * head_dim, :]  # [head_dim, seq_len]
+        score_per_head[h] = Q_h @ K_kv
 
     score_scaled = (score_per_head * float(alpha)).astype(np.float16)
     attn_per_head = np.stack([softmax_csl(score_scaled[h]) for h in range(n_heads)])  # [n_heads, bsz, seq_len]
 
-    # Step 6: Output per head; result in permuted layout matching output_tile in CSL
-    # PE px, group g: output_g = attn[h] @ XVCache[:, px*kv_dim_p_pe:(px+1)*kv_dim_p_pe]
-    # After Y-reduce; build [P, P, bsz*dim_p_pe] reference grid
+    # Step 6: Output per head (same as Phase 2 but with V_ext)
     output_grid = np.zeros((P, P, bsz * dim_p_pe), dtype=np.float32)
     for px in range(P):
         kv_head = px // pes_p_kv_head
-        v_slice = XVCache[:, px * kv_dim_p_pe:(px + 1) * kv_dim_p_pe]  # [seq_len, kv_dim_p_pe]
+        v_slice = V_ext[:, px * kv_dim_p_pe:(px + 1) * kv_dim_p_pe]  # [seq_len, kv_dim_p_pe]
         for g in range(gqa_group_size):
             h = kv_head * gqa_group_size + g
-            out_g = (attn_per_head[h].astype(np.float32) @ v_slice.astype(np.float32)).astype(np.float16)  # [bsz, kv_dim_p_pe]
-            for py in range(P):  # Y-reduce → all py identical
+            out_g = (attn_per_head[h].astype(np.float32) @ v_slice.astype(np.float32)).astype(np.float16)
+            for py in range(P):
                 output_grid[py, px, g * bsz * kv_dim_p_pe:(g + 1) * bsz * kv_dim_p_pe] = out_g.ravel()
 
     return {
-        'X_norm':        X_norm,
-        'Q_perm':        Q_perm,            # [bsz, dim] — permuted Q (no RoPE)
-        'K':             K,                 # [bsz, kv_dim]
-        'V':             V,                 # [bsz, kv_dim]
-        'attn_per_head': attn_per_head,     # [n_heads, bsz, seq_len]
-        'output_grid':   output_grid.astype(np.float16),  # [P, P, bsz*dim_p_pe]
+        'X_norm':           X_norm,
+        'Q_perm':           Q_perm,
+        'K_new':            K_new,
+        'V_new':            V_new,
+        'K_ext':            K_ext.astype(np.float16),
+        'V_ext':            V_ext.astype(np.float16),
+        'iter_num_per_pe':  iter_num_per_pe,
+        'attn_per_head':    attn_per_head,        # [n_heads, bsz, seq_len]
+        'output_grid':      output_grid.astype(np.float16),  # [P, P, bsz*dim_p_pe]
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -144,15 +163,7 @@ def show(name, arr, n=6):
     print(f"  {name:36s} {vals}{tail}")
 
 def show_all(name, grid, n=None, ref_grid=None, row_label="py"):
-    """Print a grid [rows, cols, data] in WSE-3 debug format.
-
-    For each row, concatenate data across all col entries and print one line.
-    If ref_grid is provided, print a sim line and a ref line per row.
-
-    Typical uses:
-      PE grid:    grid [P, P, data_per_pe], row_label="py"   — rows=py, cols=px
-      Head output: grid [n_heads, bsz, seq_len], row_label="head" — rows=head, cols=bsz
-    """
+    """Print a grid [rows, cols, data] in WSE-3 debug format."""
     n_rows, n_cols = grid.shape[0], grid.shape[1]
     print(f"  {name}:")
     for row in range(n_rows):
@@ -199,25 +210,32 @@ def reconstruct_QKV(qkv_grid, bsz, dim_p_pe, kv_dim_p_pe, P):
         V[:, px * kv_dim_p_pe:(px + 1) * kv_dim_p_pe] = pe[bsz * (dim_p_pe + kv_dim_p_pe):].reshape(bsz, kv_dim_p_pe)
     return Q, K, V
 
-def reconstruct_score(score_grid, bsz, seq_len_p_pe, P, n_heads, n_kv_heads, gqa_group_size):
+def reconstruct_score(score_grid, bsz, max_seq_len_p_pe, P, n_heads, n_kv_heads, gqa_group_size, iter_num_per_pe=None):
     """
-    score_grid: [P, P, bsz*gqa_group_size*seq_len_p_pe]  — all GQA groups per KV-head.
-    Returns attn [n_heads, bsz, seq_len] using the first PE of each KV-head.
-    After kv-head-scoped X-reduce + softmax, all PEs in a KV-head have same score for their group.
-    score buffer in CSL holds gqa_group_size sub-heads: [g0: bsz*seq_len_p_pe, g1: bsz*seq_len_p_pe, ...]
+    Phase 3: score_grid [P, P, gqa_group_size*bsz*max_seq_len_p_pe].
+    iter_num_per_pe: array of length P giving valid token count per PE-y.
+    Returns attn [n_heads, bsz, total_tokens] assembled from per-PE valid slots.
+    Total tokens = sum(iter_num_per_pe).
+    Global token t → PE py=t%P, slot t//P.
     """
+    if iter_num_per_pe is None:
+        iter_num_per_pe = np.full(P, max_seq_len_p_pe, dtype=int)
     pes_p_kv_head = P // n_kv_heads
-    seq_len = P * seq_len_p_pe
-    attn = np.zeros((n_heads, bsz, seq_len), dtype=np.float16)
+    total_tokens = int(np.sum(iter_num_per_pe))
+    attn = np.zeros((n_heads, bsz, total_tokens), dtype=np.float16)
     for h in range(n_heads):
         kv_head = h // gqa_group_size
         g = h % gqa_group_size
         px_kv = kv_head * pes_p_kv_head   # representative PE for KV-head
         for py in range(P):
-            pe = score_grid[py, px_kv, :]  # [bsz*gqa_group_size*seq_len_p_pe]
-            g_start = g * bsz * seq_len_p_pe
-            g_end   = (g + 1) * bsz * seq_len_p_pe
-            attn[h, :, py * seq_len_p_pe:(py + 1) * seq_len_p_pe] = pe[g_start:g_end].reshape(bsz, seq_len_p_pe)
+            iters = iter_num_per_pe[py]
+            pe = score_grid[py, px_kv, :]  # [gqa_group_size * bsz * max_seq_len_p_pe]
+            for slot in range(iters):
+                t_global = py + slot * P
+                if t_global < total_tokens:
+                    for b in range(bsz):
+                        idx = g * bsz * iters + b * iters + slot
+                        attn[h, b, t_global] = pe[idx]
     return attn
 
 def reconstruct_output(out_grid, bsz, dim_p_pe, P):
@@ -240,6 +258,47 @@ def d2h(runner, sym_id, P, bsz, data_per_pe, io_dtype, memcpy_order):
     return memcpy_view(buf, np.dtype(np.float16)).reshape(P, P, bsz * data_per_pe)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Phase 3 interleaved KV cache tiling
+# ─────────────────────────────────────────────────────────────────────────────
+
+def tile_kcache_interleaved(K_cache, P, kv_dim_p_pe, max_seq_len_p_pe, prefill_len_p_pe):
+    """
+    Build KCache_tile[P, P, kv_dim_p_pe * max_seq_len_p_pe] for H2D ROW_MAJOR.
+    PE(px, py) gets K rows px*kv_dim_p_pe..(px+1)*kv_dim_p_pe for
+    tokens {py, py+P, ..., py+(prefill_len_p_pe-1)*P} in slots 0..prefill_len_p_pe-1.
+    Slots prefill_len_p_pe..max_seq_len_p_pe-1 are zeros.
+    K_cache: [kv_dim, max_seq_len], interleaved so K_cache[:, t] = K for global token t.
+    Layout: tile[py, px, k*max_seq_len_p_pe + s] = K_cache[px*kv_dim_p_pe+k, py+s*P].
+    """
+    tile = np.zeros((P, P, kv_dim_p_pe * max_seq_len_p_pe), dtype=np.float16)
+    for py in range(P):
+        for px in range(P):
+            for s in range(prefill_len_p_pe):
+                token = py + s * P
+                k_row_start = px * kv_dim_p_pe
+                k_row_end = (px + 1) * kv_dim_p_pe
+                tile[py, px, s::max_seq_len_p_pe] = K_cache[k_row_start:k_row_end, token]
+    return tile
+
+def tile_vcache_interleaved(V_cache, P, kv_dim_p_pe, max_seq_len_p_pe, prefill_len_p_pe):
+    """
+    Build VCache_tile[P, P, max_seq_len_p_pe * kv_dim_p_pe] for H2D ROW_MAJOR.
+    PE(px, py) gets V for tokens {py, py+P, ..., py+(prefill_len_p_pe-1)*P} in rows 0..prefill_len_p_pe-1.
+    Rows prefill_len_p_pe..max_seq_len_p_pe-1 are zeros.
+    V_cache: [max_seq_len, kv_dim], interleaved so V_cache[t, :] = V for global token t.
+    Layout: tile[py, px, s*kv_dim_p_pe + j] = V_cache[py+s*P, px*kv_dim_p_pe+j].
+    """
+    tile = np.zeros((P, P, max_seq_len_p_pe * kv_dim_p_pe), dtype=np.float16)
+    for py in range(P):
+        for px in range(P):
+            j_start = px * kv_dim_p_pe
+            j_end = (px + 1) * kv_dim_p_pe
+            for s in range(prefill_len_p_pe):
+                token = py + s * P
+                tile[py, px, s * kv_dim_p_pe:(s + 1) * kv_dim_p_pe] = V_cache[token, j_start:j_end]
+    return tile
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -258,7 +317,8 @@ class Config:
         self.n_heads = 1
         self.n_kv_heads = 1
         self.head_dim = 64
-        self.seq_len = 64
+        self.max_seq_len = 128
+        self.prefill_len = 64
         self.ffn_dim = 64
 
 def parse_args():
@@ -284,30 +344,33 @@ def main():
         with open(args.config) as f:
             config.__dict__.update(json.load(f))
 
-    P          = config.P
-    bsz        = config.bsz
-    group_num  = config.group_num
-    dim        = config.dim
-    n_heads    = config.n_heads
-    n_kv_heads = config.n_kv_heads
-    head_dim   = config.head_dim
-    seq_len    = config.seq_len
-    ffn_dim    = config.ffn_dim
+    P            = config.P
+    bsz          = config.bsz
+    group_num    = config.group_num
+    dim          = config.dim
+    n_heads      = config.n_heads
+    n_kv_heads   = config.n_kv_heads
+    head_dim     = config.head_dim
+    max_seq_len  = config.max_seq_len
+    prefill_len  = config.prefill_len
+    ffn_dim      = config.ffn_dim
 
-    dim_p_pe       = dim // P
-    pes_p_head     = P // n_heads
-    pes_p_kv_head  = P // n_kv_heads
-    head_dim_p_pe  = head_dim // P
-    seq_len_p_pe   = seq_len // P
-    ffn_dim_p_pe   = ffn_dim // P
-    kv_dim         = n_kv_heads * head_dim
-    kv_dim_p_pe    = kv_dim // P
-    gqa_group_size = n_heads // n_kv_heads
-    _kv_dim_p_pe   = (kv_dim_p_pe // 2) * 2
+    dim_p_pe         = dim // P
+    pes_p_head       = P // n_heads
+    pes_p_kv_head    = P // n_kv_heads
+    head_dim_p_pe    = head_dim // P
+    max_seq_len_p_pe = max_seq_len // P
+    prefill_len_p_pe = prefill_len // P
+    ffn_dim_p_pe     = ffn_dim // P
+    kv_dim           = n_kv_heads * head_dim
+    kv_dim_p_pe      = kv_dim // P
+    gqa_group_size   = n_heads // n_kv_heads
+    _kv_dim_p_pe     = (kv_dim_p_pe // 2) * 2
 
     print(f"Host: P={P}  bsz={bsz}  dim={dim}  n_heads={n_heads}  n_kv_heads={n_kv_heads}  gqa_group_size={gqa_group_size}")
-    print(f"      head_dim={head_dim}  seq_len={seq_len}  ffn_dim={ffn_dim}")
-    print(f"      dim_p_pe={dim_p_pe}  kv_dim_p_pe={kv_dim_p_pe}  pes_p_head={pes_p_head}  pes_p_kv_head={pes_p_kv_head}  seq_len_p_pe={seq_len_p_pe}")
+    print(f"      head_dim={head_dim}  max_seq_len={max_seq_len}  prefill_len={prefill_len}  ffn_dim={ffn_dim}")
+    print(f"      dim_p_pe={dim_p_pe}  kv_dim_p_pe={kv_dim_p_pe}  pes_p_head={pes_p_head}  pes_p_kv_head={pes_p_kv_head}")
+    print(f"      max_seq_len_p_pe={max_seq_len_p_pe}  prefill_len_p_pe={prefill_len_p_pe}")
     if args.simple:
         print(f"  [simple mode: fill={args.fill}  identity RoPE  easy hand-verification]")
 
@@ -322,46 +385,28 @@ def main():
         if args.simple:
             return np.full(shape, fill, dtype=np.float16)
         return np.random.rand(*shape).astype(np.float16)
-    
+
     def mk_dim(*shape):
         if args.simple:
             X = np.zeros(shape, dtype=np.float16)
-            # Iterate over all elements regardless of shape
             for idx in np.ndindex(*shape):
-                # idx is a tuple like (0,), (0,0), (0,0,0), etc. depending on shape
-                # Example: set value based on index
                 X[idx] = sum(idx) * 0.1
             return X
         return np.random.rand(*shape).astype(np.float16)
 
-    # Raw 1D input (same at every PE row — tiled below)
-    # X_raw    = mk(1, bsz * dim, fill=args.fill)                      # [1, bsz*dim]
-    X_raw    = mk(1, bsz * dim, fill=.1) #mk_dim(1, bsz * dim)
-    W_raw    = mk(1, dim, fill=args.fill)                             # [1, dim] — RMSNorm weights
+    X_raw    = mk(1, bsz * dim, fill=.1)
+    W_raw    = mk(1, dim, fill=args.fill)
 
-    
-    tensor_q_weight = mk_dim(dim, dim) * 0.1
-    # tensor_k_weight = mk_dim(dim, kv_dim) * 0.1
-    # tensor_v_weight = mk_dim(dim, kv_dim) * 0.1
-    tensor_k_weight = mk(dim, kv_dim, fill=.2)
-    tensor_v_weight = mk(dim, kv_dim, fill=.3)
-    # tensor_q_weight = mk(dim, dim, fill=1)
-    # tensor_k_weight = mk(dim, dim, fill=2)
-    # tensor_v_weight = mk(dim, dim, fill=3)
-    # tensor_q_weight = mk_dim(dim, dim)
-    # tensor_k_weight = mk(dim, dim)
-    # tensor_v_weight = mk(dim, dim)
+    tensor_q_weight  = mk_dim(dim, dim) * 0.1
+    tensor_k_weight  = mk(dim, kv_dim, fill=.2)
+    tensor_v_weight  = mk(dim, kv_dim, fill=.3)
 
-    # RMSNorm reference weight (same at every PE, PE's slice = W[px*dim_p_pe:])
-    W_norm_flat = W_raw.ravel()                       # [dim]
+    W_norm_flat = W_raw.ravel()  # [dim]
 
     _dim_p_pe = dim_p_pe if (dim_p_pe % 2 == 0) else dim_p_pe - 1
 
-    # RoPE: identity for simple mode, head-local otherwise
+    # RoPE freqs
     if args.simple:
-        freqs_cos_full = np.ones(P * (_dim_p_pe // 2), dtype=np.float16)
-        freqs_sin_full = np.zeros(P * (_dim_p_pe // 2), dtype=np.float16)
-        # Each PE gets its own slice reshaped below; for flat storage:
         base_cos = np.ones(head_dim // 2, dtype=np.float16)
         base_sin = np.zeros(head_dim // 2, dtype=np.float16)
     else:
@@ -378,13 +423,9 @@ def main():
         if _half_head > 0:
             pe_freqs_sin[_px, :] = np.tile(base_sin[start:end], n_heads)
             pe_freqs_cos[_px, :] = np.tile(base_cos[start:end], n_heads)
-    # Freqs must vary with px (column), not py (row):
-    # PE(px,py) gets pe_freqs[px,:] via ROW_MAJOR memcpy [py, px*count:(px+1)*count]
-    # → tile pe_freqs.ravel() (which is [pe0, pe1, ..., pe_{P-1}]) uniformly across all rows
     tensor_freqs_sin = np.tile(pe_freqs_sin.ravel(), (P, 1))
     tensor_freqs_cos = np.tile(pe_freqs_cos.ravel(), (P, 1))
 
-    # Build global freqs arrays for reference computation (size dim//2)
     freqs_cos_ref = np.zeros(dim // 2, dtype=np.float16)
     freqs_sin_ref = np.zeros(dim // 2, dtype=np.float16)
     for _px in range(P):
@@ -392,18 +433,25 @@ def main():
         freqs_cos_ref[off: off + _dim_p_pe // 2] = pe_freqs_cos[_px, :]
         freqs_sin_ref[off: off + _dim_p_pe // 2] = pe_freqs_sin[_px, :]
 
-    tensor_XKCache = mk(kv_dim, seq_len, fill=.4)
-    tensor_XVCache = mk(seq_len, kv_dim, fill=.5)
-    tensor_o_weight   = mk(dim, dim)
-    tensor_up_weight  = mk(dim, ffn_dim)
+    # ─── Phase 3 KV cache: max_seq_len capacity, only prefill_len positions filled ─
+    # Interleaved layout: tensor_XKCache[:, t] = K for global token t
+    #   (so PE py=t%P, slot t//P sees it).
+    # Only tokens 0..prefill_len-1 are pre-loaded; rest are zeros.
+    tensor_XKCache = np.zeros((kv_dim, max_seq_len), dtype=np.float16)
+    tensor_XVCache = np.zeros((max_seq_len, kv_dim), dtype=np.float16)
+    if args.simple:
+        tensor_XKCache[:, :prefill_len] = np.full((kv_dim, prefill_len), 0.4, dtype=np.float16)
+        tensor_XVCache[:prefill_len, :] = np.full((prefill_len, kv_dim), 0.5, dtype=np.float16)
+    else:
+        tensor_XKCache[:, :prefill_len] = np.random.rand(kv_dim, prefill_len).astype(np.float16)
+        tensor_XVCache[:prefill_len, :] = np.random.rand(prefill_len, kv_dim).astype(np.float16)
+
+    tensor_o_weight    = mk(dim, dim)
+    tensor_up_weight   = mk(dim, ffn_dim)
     tensor_gate_weight = mk(dim, ffn_dim)
     tensor_down_weight = mk(ffn_dim, dim)
 
     # ─── W_Q / W_O offline column permutation (Option C GQA) ──────────────────
-    # For Q-head h = kv_head * gqa_group_size + g, PE s within KV-head:
-    #   old_col = h * head_dim + s * kv_dim_p_pe
-    #   new_col = kv_head * pes_p_kv_head * dim_p_pe + s * dim_p_pe + g * kv_dim_p_pe
-    # W_O permuted symmetrically on the row dimension.
     W_Q_perm = np.zeros((dim, dim), dtype=np.float16)
     W_O_perm = np.zeros((dim, dim), dtype=np.float16)
     for _h in range(n_heads):
@@ -432,13 +480,11 @@ def main():
     GT_tile = tile_weight_row(tensor_gate_weight, dim_p_pe, ffn_dim_p_pe)
     DN_tile = tile_weight_row(tensor_down_weight, ffn_dim_p_pe, dim_p_pe)
 
-    # KCache: tensor_XKCache[dim, seq_len]. tile_weight_row gives result[a,b,:] = W[a*rows:,b*cols:].
-    # ROW_MAJOR h2d sends result[py, px, :] to PE(px, py).
-    # So without swap: PE(px,py) gets W[py*dim_p_pe:, px*seq_len_p_pe:] — K-dim indexed by py, seq by px (wrong).
-    # Need: PE(px,py) gets W[px*dim_p_pe:, py*seq_len_p_pe:] — K-dim indexed by px (matches Q), seq by py.
-    # Fix: swapaxes(0,1) so new[py,px,:] = old[px,py,:] = W[px*dim_p_pe:, py*seq_len_p_pe:].
-    KCache_tile = tile_weight_row(tensor_XKCache, kv_dim_p_pe, seq_len_p_pe).swapaxes(0, 1)
-    VCache_tile = tile_weight_row(tensor_XVCache, seq_len_p_pe, kv_dim_p_pe)
+    # Phase 3 interleaved KV cache tiling:
+    # PE(px, py) gets K/V for tokens {py, py+P, ..., py+(prefill_len_p_pe-1)*P}.
+    KCache_tile = tile_kcache_interleaved(tensor_XKCache, P, kv_dim_p_pe, max_seq_len_p_pe, prefill_len_p_pe)
+    VCache_tile = tile_vcache_interleaved(tensor_XVCache, P, kv_dim_p_pe, max_seq_len_p_pe, prefill_len_p_pe)
+
     # ─── Runner ───────────────────────────────────────────────────────────────
     runner = SdkRuntime("out", simfab_numthreads=64, msg_level='INFO')
     runner.load()
@@ -488,8 +534,8 @@ def main():
     h2d(sym_V_weight,    V_tile,        dim_p_pe * kv_dim_p_pe)
     h2d(sym_freqs_sin,   tensor_freqs_sin, _dim_p_pe // 2)
     h2d(sym_freqs_cos,   tensor_freqs_cos, _dim_p_pe // 2)
-    h2d(sym_XKCache,     KCache_tile,   kv_dim_p_pe * seq_len_p_pe)
-    h2d(sym_XVCache,     VCache_tile,   seq_len_p_pe * kv_dim_p_pe)
+    h2d(sym_XKCache,     KCache_tile,   kv_dim_p_pe * max_seq_len_p_pe)
+    h2d(sym_XVCache,     VCache_tile,   max_seq_len_p_pe * kv_dim_p_pe)
     h2d(sym_O_weight,    O_tile,        dim_p_pe * dim_p_pe)
     h2d(sym_UP_weight,   UP_tile,       dim_p_pe * ffn_dim_p_pe)
     h2d(sym_GATE_weight, GT_tile,       dim_p_pe * ffn_dim_p_pe)
@@ -519,9 +565,10 @@ def main():
         proj_grid         = d2h(runner, sym_QKV_post_proj,    P, bsz, dim_p_pe + 2 * kv_dim_p_pe,  io_dtype, memcpy_order)
         reduce_grid       = d2h(runner, sym_QKV_post_reduce,  P, bsz, dim_p_pe + 2 * kv_dim_p_pe,  io_dtype, memcpy_order)
         qkv_grid          = d2h(runner, sym_QKV_tile,         P, bsz, dim_p_pe + 2 * kv_dim_p_pe,  io_dtype, memcpy_order)
-        score_gemv_grid   = d2h(runner, sym_score_post_gemv,  P, bsz, seq_len_p_pe,  io_dtype, memcpy_order)
-        score_reduce_grid = d2h(runner, sym_score_post_reduce, P, bsz, seq_len_p_pe, io_dtype, memcpy_order)
-        score_grid        = d2h(runner, sym_score,             P, bsz, gqa_group_size * seq_len_p_pe,  io_dtype, memcpy_order)
+        # Score buffers: all gqa_group_size groups, max_seq_len_p_pe per group (only iter_num[py] valid)
+        score_gemv_grid   = d2h(runner, sym_score_post_gemv,  P, bsz, gqa_group_size * max_seq_len_p_pe, io_dtype, memcpy_order)
+        score_reduce_grid = d2h(runner, sym_score_post_reduce, P, bsz, gqa_group_size * max_seq_len_p_pe, io_dtype, memcpy_order)
+        score_grid        = d2h(runner, sym_score,             P, bsz, gqa_group_size * max_seq_len_p_pe,  io_dtype, memcpy_order)
         out_grid          = d2h(runner, sym_output_tile,       P, bsz, dim_p_pe,      io_dtype, memcpy_order)
 
     # ─── D2H: timer ───────────────────────────────────────────────────────────
@@ -557,15 +604,20 @@ def main():
         freqs_cos_ref, freqs_sin_ref,
         tensor_XKCache, tensor_XVCache,
         P, n_heads, n_kv_heads, head_dim,
-        dim_p_pe, kv_dim_p_pe, seq_len_p_pe, gqa_group_size, pes_p_kv_head
+        dim_p_pe, kv_dim_p_pe, max_seq_len_p_pe, prefill_len_p_pe,
+        gqa_group_size, pes_p_kv_head
     )
+
+    iter_num_per_pe = ref['iter_num_per_pe']
+    prefill_len_ref = P * prefill_len_p_pe
+    seq_len_ref     = prefill_len_ref + 1  # total tokens for step 0
 
     all_ok = True
 
     # ── Freqs sanity check ─────────────────────────────────────────────────────
     sep("Freqs sanity check  (verify PE received correct freqs_cos/sin)")
     for px in range(min(P, 4)):
-        sim_cos = freqs_cos_grid[0, px, :]   # py=0 (all py same)
+        sim_cos = freqs_cos_grid[0, px, :]
         exp_cos = pe_freqs_cos[px, :]
         sim_sin = freqs_sin_grid[0, px, :]
         exp_sin = pe_freqs_sin[px, :]
@@ -577,13 +629,10 @@ def main():
 
     # ── Step 2a: Post-projection (local partial GEMV, before Y-reduce) ────────
     sep("Step 2a — Post-projection  (local partial GEMV per PE, before Y-reduce)")
-    print("  PE(px,py): Q uses W_Q_perm, K/V use compact weights")
-    print(f"  Buffer layout per PE: [Q:{bsz}*{dim_p_pe} | K:{bsz}*{kv_dim_p_pe} | V:{bsz}*{kv_dim_p_pe}]")
-    X_norm = ref['X_norm']   # [bsz, dim]
-    # Build per-PE partial reference [P, P, bsz*(dim_p_pe + 2*kv_dim_p_pe)]
+    X_norm = ref['X_norm']
     proj_ref = np.zeros((P, P, bsz * (dim_p_pe + 2 * kv_dim_p_pe)), dtype=np.float32)
     for py in range(P):
-        x_row = X_norm[:, py*dim_p_pe:(py+1)*dim_p_pe].astype(np.float32)  # [bsz, dim_p_pe]
+        x_row = X_norm[:, py*dim_p_pe:(py+1)*dim_p_pe].astype(np.float32)
         for px in range(P):
             q_p = x_row @ W_Q_perm[py*dim_p_pe:(py+1)*dim_p_pe, px*dim_p_pe:(px+1)*dim_p_pe].astype(np.float32)
             k_p = x_row @ tensor_k_weight[py*dim_p_pe:(py+1)*dim_p_pe, px*kv_dim_p_pe:(px+1)*kv_dim_p_pe].astype(np.float32)
@@ -592,7 +641,6 @@ def main():
             proj_ref[py, px, bsz*dim_p_pe:bsz*(dim_p_pe+kv_dim_p_pe)] = k_p.ravel()
             proj_ref[py, px, bsz*(dim_p_pe+kv_dim_p_pe):] = v_p.ravel()
     proj_ref = proj_ref.astype(np.float16)
-    # Show and compare
     show("Q_sim  PE(0,0) partial", proj_grid[0, 0, :bsz*dim_p_pe].astype(np.float32))
     show("Q_ref  PE(0,0) partial", proj_ref[0, 0, :bsz*dim_p_pe].astype(np.float32))
     all_ok &= cmp("Step2a Q-partial  sim vs ref", proj_grid[:,:,:bsz*dim_p_pe], proj_ref[:,:,:bsz*dim_p_pe])
@@ -601,8 +649,6 @@ def main():
 
     # ── Step 2b: Post-Y-reduce (full projection, before RoPE) ────────────────
     sep("Step 2b — Post-Y-reduce  (full Q/K/V, all py identical, before RoPE)")
-    print("  After Y-reduce PE(px,py) holds: Q slice (dim_p_pe) + K/V slices (kv_dim_p_pe each)")
-    print(f"  Buffer layout per PE: [Q:{bsz}*{dim_p_pe} | K:{bsz}*{kv_dim_p_pe} | V:{bsz}*{kv_dim_p_pe}]")
     Q_full = (X_norm.astype(np.float32) @ W_Q_perm.astype(np.float32)).astype(np.float16)
     K_full = (X_norm.astype(np.float32) @ tensor_k_weight.astype(np.float32)).astype(np.float16)
     V_full = (X_norm.astype(np.float32) @ tensor_v_weight.astype(np.float32)).astype(np.float16)
@@ -618,12 +664,6 @@ def main():
     all_ok &= cmp("Step2b K-reduced  sim vs ref", reduce_grid[:,:,bsz*dim_p_pe:bsz*(dim_p_pe+kv_dim_p_pe)], reduce_ref[:,:,bsz*dim_p_pe:bsz*(dim_p_pe+kv_dim_p_pe)])
     all_ok &= cmp("Step2b V-reduced  sim vs ref", reduce_grid[:,:,bsz*(dim_p_pe+kv_dim_p_pe):], reduce_ref[:,:,bsz*(dim_p_pe+kv_dim_p_pe):])
 
-    show_all("reduce_grid", reduce_grid)
-    # ── Step 2c: Post-RoPE — SKIPPED (RoPE disabled in CSL, strided-DSD bug TBD) ──
-    # Q_sim, K_sim, V_sim = reconstruct_QKV(qkv_grid, bsz, dim_p_pe, P)
-    # all_ok &= cmp("Step2c Q-rope  sim vs ref", Q_sim, ref['Q_rope'])
-    # all_ok &= cmp("Step2c K-rope  sim vs ref", K_sim, ref['K_rope'])
-    # all_ok &= cmp("Step2c V       sim vs ref", V_sim, ref['V'])
     sep("Step 2c — Post-RoPE  [SKIPPED — RoPE disabled, strided-DSD @fmulh bug TBD]")
     print("  xq_rope()/xk_rope() are no-ops; QKV_tile == post-reduce Q/K/V")
 
@@ -631,105 +671,161 @@ def main():
         xnorm = float(ref['X_norm'][0, 0])
         q_exp = dim * xnorm
         print(f"\n  Hand-check: X_norm≈{xnorm:.4f}  Q[any]=dim×X_norm×W_q={dim}×{xnorm:.4f}×{args.fill}={q_exp:.4f}")
-        print(f"  (With cos=1,sin=0: RoPE swaps even/odd; all-ones Q → unchanged)")
 
-    attn_sim             = reconstruct_score(score_grid, bsz, seq_len_p_pe, P, n_heads, n_kv_heads, gqa_group_size)
-    out_sim              = reconstruct_output(out_grid,  bsz, dim_p_pe, P)
-
-    alpha_val = np.float16(1.0 / np.sqrt(head_dim))
-
-    # ── Build per-PE reference for step 5a and 5b ─────────────────────────────
-    # Q after reduce (RoPE disabled) — using permuted W_Q layout
     Q_perm_full = (ref['X_norm'].astype(np.float32) @ W_Q_perm.astype(np.float32)).astype(np.float16)
 
-    # 5a reference (GQA, g=0 sub-head):
-    #   PE(px, py): score_partial_g0 = Q_perm[g=0 slice at px] @ KCache[px kv-rows, py tokens]
-    #   Q_perm g=0 slice at px = Q_perm_full[:, px*dim_p_pe : px*dim_p_pe + kv_dim_p_pe]
-    #   KCache compact: [kv_dim, seq_len], PE px has rows [px*kv_dim_p_pe:(px+1)*kv_dim_p_pe]
-    score_5a_ref = np.zeros((P, P, bsz * seq_len_p_pe), dtype=np.float16)
-    for py in range(P):
-        for px in range(P):
-            q_g0 = Q_perm_full[:, px * dim_p_pe : px * dim_p_pe + kv_dim_p_pe]  # [bsz, kv_dim_p_pe]
-            k_local = tensor_XKCache[px * kv_dim_p_pe:(px + 1) * kv_dim_p_pe,
-                                     py * seq_len_p_pe:(py + 1) * seq_len_p_pe]  # [kv_dim_p_pe, seq_len_p_pe]
-            partial = (q_g0.astype(np.float32) @ k_local.astype(np.float32)).astype(np.float16)
-            score_5a_ref[py, px, :] = partial.ravel()
+    # ── Build per-PE reference for step 5a and 5b (Phase 3: variable iter_num, all groups) ──
+    # Layout mirrors device: iter_num-packed — group g at offset g*bsz*iters (stride=bsz*iters).
+    # This matches the CSL score buffer where out_vector_dsd carries over between GEMV group calls.
+    # K_pe(px, py): slot s → token = py + s*P; prefill from tensor_XKCache, new token from K_new (py=0 only)
+    alpha_val = np.float16(1.0 / np.sqrt(head_dim))
 
-    # 5b reference (GQA, g=0 sub-head):
-    #   After KV-head-scoped X-reduce + alpha scale.
-    #   All pes_p_kv_head PEs in the same KV-head block share the same reduced score.
-    score_5b_ref = np.zeros((P, P, bsz * seq_len_p_pe), dtype=np.float16)
+    score_5a_ref = np.zeros((P, P, bsz * gqa_group_size * max_seq_len_p_pe), dtype=np.float16)
     for py in range(P):
+        iters = iter_num_per_pe[py]
+        for px in range(P):
+            K_pe = np.zeros((kv_dim_p_pe, iters), dtype=np.float32)
+            for s in range(min(iters, prefill_len_p_pe)):
+                token = py + s * P
+                K_pe[:, s] = tensor_XKCache[px * kv_dim_p_pe:(px + 1) * kv_dim_p_pe, token].astype(np.float32)
+            if iters > prefill_len_p_pe:  # py == 0: new token at slot prefill_len_p_pe
+                K_pe[:, prefill_len_p_pe] = ref['K_new'][0, px * kv_dim_p_pe:(px + 1) * kv_dim_p_pe].astype(np.float32)
+            for g in range(gqa_group_size):
+                q_g = Q_perm_full[:, px * dim_p_pe + g * kv_dim_p_pe : px * dim_p_pe + (g + 1) * kv_dim_p_pe].astype(np.float32)
+                partial = (q_g @ K_pe).astype(np.float16)  # [bsz, iters]
+                for b in range(bsz):
+                    base = g * bsz * iters + b * iters      # iter_num-packed, matches device
+                    score_5a_ref[py, px, base : base + iters] = partial[b, :]
+
+    # score_5b_ref: after KV-head-scoped X-reduce + alpha scale (all groups, iter_num-packed)
+    score_5b_ref = np.zeros((P, P, bsz * gqa_group_size * max_seq_len_p_pe), dtype=np.float16)
+    for py in range(P):
+        iters = iter_num_per_pe[py]
         for kv_head_i in range(n_kv_heads):
-            kv_score = np.zeros((bsz, seq_len_p_pe), dtype=np.float32)
-            for px in range(kv_head_i * pes_p_kv_head, (kv_head_i + 1) * pes_p_kv_head):
-                kv_score += score_5a_ref[py, px, :].reshape(bsz, seq_len_p_pe).astype(np.float32)
-            kv_score_scaled = (kv_score * float(alpha_val)).astype(np.float16)
-            for px in range(kv_head_i * pes_p_kv_head, (kv_head_i + 1) * pes_p_kv_head):
-                score_5b_ref[py, px, :] = kv_score_scaled.ravel()
+            for g in range(gqa_group_size):
+                kv_sum = np.zeros((bsz, iters), dtype=np.float32)
+                for px in range(kv_head_i * pes_p_kv_head, (kv_head_i + 1) * pes_p_kv_head):
+                    for b in range(bsz):
+                        base = g * bsz * iters + b * iters
+                        kv_sum[b, :] += score_5a_ref[py, px, base : base + iters].astype(np.float32)
+                kv_sum_scaled = (kv_sum * float(alpha_val)).astype(np.float16)
+                for px in range(kv_head_i * pes_p_kv_head, (kv_head_i + 1) * pes_p_kv_head):
+                    for b in range(bsz):
+                        base = g * bsz * iters + b * iters
+                        score_5b_ref[py, px, base : base + iters] = kv_sum_scaled[b, :]
 
     show_all("qkv_grid", qkv_grid)
+
     # ── Step 5a: post-GEMV (per-PE partial, before KV-head-scoped reduce) ────────
-    sep("Step 5a — post-score GEMV  (g=0 partial dot product per PE, before KV-head-scoped X-reduce)")
-    print("  PE(py,px): score_g0_partial = Q_perm[g=0 slice at px] @ KCache[px kv-rows, py tokens]")
-    print(f"  KCache compact: [{kv_dim}×{seq_len}], each PE has {kv_dim_p_pe} rows")
+    sep(f"Step 5a — post-score GEMV  (all {gqa_group_size} groups per PE, before KV-head-scoped X-reduce)")
+    print(f"  Phase 3: iter_num per PE = {iter_num_per_pe.tolist()}  (prefill_len_p_pe={prefill_len_p_pe} + new token at py=0)")
     show_all("score_gemv_sim", score_gemv_grid)
     show_all("score_5a_ref",   score_5a_ref)
-    # Check representative PE per KV-head (first PE of each KV-head block)
     for kv_head_i in range(n_kv_heads):
         px0 = kv_head_i * pes_p_kv_head
-        all_ok &= cmp(f"Step5a score_post_gemv kv_head {kv_head_i} (px={px0})", score_gemv_grid[:, px0, :], score_5a_ref[:, px0, :])
+        for g in range(gqa_group_size):
+            for py in range(P):
+                iters = iter_num_per_pe[py]
+                for b in range(bsz):
+                    base = g * bsz * iters + b * iters      # iter_num-packed (both sim and ref)
+                    all_ok &= cmp(
+                        f"Step5a score_post_gemv kv_head={kv_head_i} g={g} py={py} b={b} (px={px0})",
+                        score_gemv_grid[py, px0, base : base + iters],
+                        score_5a_ref[py, px0, base : base + iters]
+                    )
 
     # ── Step 5b: post-KV-head-scoped-reduce + scale (before softmax) ──────────
-    sep("Step 5b — post KV-head-scoped X-reduce + alpha scale  (g=0 sub-head, before softmax)")
-    print("  All pes_p_kv_head PEs in same KV-head block see identical reduced+scaled score")
+    sep(f"Step 5b — post KV-head-scoped X-reduce + alpha scale  (all {gqa_group_size} groups, before softmax)")
     show_all("score_reduce_sim", score_reduce_grid)
     show_all("score_5b_ref",     score_5b_ref)
     for kv_head_i in range(n_kv_heads):
         px0 = kv_head_i * pes_p_kv_head
-        all_ok &= cmp(f"Step5b score_post_reduce kv_head {kv_head_i} (px={px0})", score_reduce_grid[:, px0, :], score_5b_ref[:, px0, :])
-        # Verify all PEs in KV-head block are identical
-        for px in range(px0 + 1, (kv_head_i + 1) * pes_p_kv_head):
-            max_diff = float(np.max(np.abs(score_reduce_grid[:, px, :].astype(np.float32)
-                                          - score_reduce_grid[:, px0, :].astype(np.float32))))
-            print(f"  [{'OK' if max_diff < 0.01 else 'MISMATCH'}] kv_head {kv_head_i}: PE px={px} identical to px={px0}  max_diff={max_diff:.5f}")
+        for g in range(gqa_group_size):
+            for py in range(P):
+                iters = iter_num_per_pe[py]
+                for b in range(bsz):
+                    base = g * bsz * iters + b * iters      # iter_num-packed (both sim and ref)
+                    all_ok &= cmp(
+                        f"Step5b score_post_reduce kv_head={kv_head_i} g={g} py={py} b={b}",
+                        score_reduce_grid[py, px0, base : base + iters],
+                        score_5b_ref[py, px0, base : base + iters]
+                    )
+        # Verify all PEs in KV-head block are identical (for each py, all groups)
+        for py in range(P):
+            iters = iter_num_per_pe[py]
+            for px in range(px0 + 1, (kv_head_i + 1) * pes_p_kv_head):
+                max_diff = float(np.max(np.abs(
+                    score_reduce_grid[py, px, :gqa_group_size * iters * bsz].astype(np.float32)
+                    - score_reduce_grid[py, px0, :gqa_group_size * iters * bsz].astype(np.float32)
+                )))
+                print(f"  [{'OK' if max_diff < 0.01 else 'MISMATCH'}] kv_head {kv_head_i} py={py}: px={px} identical to px={px0}  max_diff={max_diff:.5f}")
 
     # ── Step 5c: post-softmax (attn weights) ──────────────────────────────────
     sep("Step 5c — post-softmax  (final attention weights)")
-    print(f"  [score buffer after softmax_score()]")
-    # attn_sim / ref: [n_heads, bsz, seq_len] — treat as [rows=n_heads, cols=bsz, data=seq_len]
-    show_all("attn sim vs ref", attn_sim, ref_grid=ref['attn_per_head'], row_label="head")
-    for h in range(n_heads):
-        show(f"attn_sim head {h} (from PE)", attn_sim[h, 0])
-        show(f"attn_ref head {h} (numpy)", ref['attn_per_head'][h, 0])
-        all_ok &= cmp(f"Step5c attn head {h}  sim vs ref", attn_sim[h], ref['attn_per_head'][h])
-        s_sim = float(np.sum(attn_sim[h, 0].astype(np.float32)))
-        s_ref = float(np.sum(ref['attn_per_head'][h, 0].astype(np.float32)))
-        print(f"    sum(attn head {h}): sim={s_sim:.6f}  ref={s_ref:.6f}  (expect ≈1.0)")
+    # Build attn_ref_grid in PE-grid format [P, P, bsz*gqa_group_size*max_seq_len_p_pe]
+    # iter_num-packed layout — matches score_grid exactly (no padding, no reordering)
+    attn_ref_grid = np.zeros((P, P, bsz * gqa_group_size * max_seq_len_p_pe), dtype=np.float16)
+    for px in range(P):
+        kv_head = px // pes_p_kv_head
+        for py in range(P):
+            iters = iter_num_per_pe[py]
+            for g in range(gqa_group_size):
+                h = kv_head * gqa_group_size + g
+                for b in range(bsz):
+                    for slot in range(iters):
+                        t_global = py + slot * P
+                        if t_global < seq_len_ref:
+                            attn_ref_grid[py, px, g * bsz * iters + b * iters + slot] = ref['attn_per_head'][h, b, t_global]
+
+    show_all("attn_sim", score_grid)
+    show_all("attn_ref", attn_ref_grid)
+
+    # Compare raw buffers (iter_num-packed, same format as device) — same pattern as 5a/5b
+    for kv_head_i in range(n_kv_heads):
+        px0 = kv_head_i * pes_p_kv_head
+        for g in range(gqa_group_size):
+            for py in range(P):
+                iters = iter_num_per_pe[py]
+                for b in range(bsz):
+                    base = g * bsz * iters + b * iters
+                    all_ok &= cmp(
+                        f"Step5c attn kv_head={kv_head_i} g={g} py={py} b={b}",
+                        score_grid[py, px0, base : base + iters],
+                        attn_ref_grid[py, px0, base : base + iters]
+                    )
+        # Sum ≈ 1.0 check per head (summed over all PEs' valid slots from raw buffer)
+        for g in range(gqa_group_size):
+            h = kv_head_i * gqa_group_size + g
+            px0 = kv_head_i * pes_p_kv_head
+            for b in range(bsz):
+                s_sim = sum(
+                    float(np.sum(score_grid[py, px0,
+                        g * bsz * iter_num_per_pe[py] + b * iter_num_per_pe[py] :
+                        g * bsz * iter_num_per_pe[py] + (b + 1) * iter_num_per_pe[py]
+                    ].astype(np.float32)))
+                    for py in range(P)
+                )
+                s_ref = float(np.sum(ref['attn_per_head'][h, b].astype(np.float32)))
+                print(f"    sum(attn h={h} b={b}): sim={s_sim:.6f}  ref={s_ref:.6f}  (expect ≈1.0)")
 
     if args.simple:
         alpha_f = 1.0 / np.sqrt(float(head_dim))
         q_val = float(ref['Q_perm'][0, 0])
         k_val = float(tensor_XKCache[0, 0])
-        score_exp = pes_p_kv_head * kv_dim_p_pe * q_val * k_val
-        print(f"\n  Hand-check (g=0): score=pes_p_kv_head×kv_dim_p_pe×q×k={pes_p_kv_head}×{kv_dim_p_pe}×{q_val:.4f}×{k_val:.4f}={score_exp:.4f}")
-        print(f"  Scaled: ×{alpha_f:.4f} → {score_exp*alpha_f:.4f}.  Uniform → attn≈1/{seq_len}={1.0/seq_len:.6f}")
+        print(f"\n  Hand-check (g=0): seq_len_ref={seq_len_ref}  alpha={alpha_f:.4f}")
 
     # ── Step 6: output_matvec_mult ───────────────────────────────────────────
     sep("Step 6 — output_matvec_mult  (gqa_group_size attn@V GEMVs + Y-reduce)")
-    out_ref = reconstruct_output(ref['output_grid'], bsz, dim_p_pe, P)
-    show("output_sim (from PE)", out_sim[0])
-    show("output_ref (numpy)",   out_ref[0])
-    all_ok &= cmp("output  sim vs ref", out_sim, out_ref)
-
-    if args.simple:
-        o_exp = float(args.fill)   # uniform attn × all-fill-V → fill
-        print(f"\n  Hand-check: uniform attn × all-{args.fill} V → output≈{o_exp:.4f}")
+    show_all("output_sim", out_grid)
+    show_all("output_ref", ref['output_grid'])
+    all_ok &= cmp("output  sim vs ref", out_grid, ref['output_grid'])
 
     # ── Summary ───────────────────────────────────────────────────────────────
     sep("Validation Summary")
     print(f"  Config: P={P}  n_heads={n_heads}  n_kv_heads={n_kv_heads}  gqa_group_size={gqa_group_size}")
-    print(f"          pes_p_head={pes_p_head}  pes_p_kv_head={pes_p_kv_head}  dim={dim}  kv_dim={kv_dim}  seq_len={seq_len}")
+    print(f"          pes_p_head={pes_p_head}  pes_p_kv_head={pes_p_kv_head}  dim={dim}  kv_dim={kv_dim}")
+    print(f"          max_seq_len={max_seq_len}  prefill_len={prefill_len}  seq_len_for_step0={seq_len_ref}")
+    print(f"          iter_num_per_pe={iter_num_per_pe.tolist()}")
     print(f"  simple={args.simple}  fill={args.fill}")
     print()
     print(f"  Steps validated (sim = WSE-3 simulator, ref = numpy reference):")
@@ -737,7 +833,7 @@ def main():
     print(f"    2b.  QKV post-Y-reduce   full Q/K/V (before RoPE, which is disabled)")
     print(f"    5a.  Score post-GEMV     g=0 partial per PE, before KV-head-scoped reduce")
     print(f"    5b.  Score post-reduce   g=0 after KV-head-scoped X-reduce + alpha scale")
-    print(f"    5c.  Attn weights        n_heads={n_heads} heads, post-softmax")
+    print(f"    5c.  Attn weights        n_heads={n_heads} heads, post-softmax, seq_len={seq_len_ref}")
     print(f"    6.   output_matvec       {gqa_group_size} attn@V GEMVs + Y-reduce")
     print()
     print(f"  Overall: {'ALL PASS ✓' if all_ok else 'SOME FAILURES — check output above'}")
