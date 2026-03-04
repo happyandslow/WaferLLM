@@ -62,13 +62,15 @@ def softmax_csl(score):
 def compute_reference(X, W_norm, W_Q_perm, W_K, W_V, freqs_cos, freqs_sin,
                       XKCache, XVCache, P, n_heads, n_kv_heads, head_dim,
                       dim_p_pe, kv_dim_p_pe, max_seq_len_p_pe, prefill_len_p_pe,
-                      gqa_group_size, pes_p_kv_head):
+                      gqa_group_size, pes_p_kv_head, total_steps=1):
     """
-    Phase 3 reference for decode step 0.
+    Phase 3 reference for the final decode step after total_steps steps.
     XKCache: [kv_dim, max_seq_len] — only cols 0..prefill_len-1 valid (interleaved).
     XVCache: [max_seq_len, kv_dim] — only rows 0..prefill_len-1 valid (interleaved).
     Interleaved layout: XKCache[:, t] is for global token t (PE py=t%P, slot t//P).
-    After process_kv (step=0): PE py=0 adds new K/V at slot prefill_len_p_pe.
+    After total_steps decode steps: each step s writes to PE py=s%P at slot
+      prefill_len_p_pe + s//P.  Since X is constant across steps, K_new and V_new
+    are identical for every decode step.
     Returns dict with iter_num_per_pe, attn_per_head, output_grid, etc.
     """
     kv_dim = n_kv_heads * head_dim
@@ -88,25 +90,26 @@ def compute_reference(X, W_norm, W_Q_perm, W_K, W_V, freqs_cos, freqs_sin,
     Q_rope = Q_perm
     K_rope = K_new
 
-    # After process_kv() at step=0: PE py=0 writes new K/V at slot prefill_len_p_pe.
-    # iter_num[py=0] = prefill_len_p_pe + 1; iter_num[py>0] = prefill_len_p_pe.
-    iter_num_per_pe = np.full(P, prefill_len_p_pe, dtype=int)
-    iter_num_per_pe[0] += 1  # PE py=0 increments after writing new token
+    # After total_steps decode steps:
+    # PE py receives writes at decode steps {py, py+P, py+2P, ...}.
+    # iter_num_per_pe[py] = prefill_len_p_pe + number of those steps < total_steps.
+    iter_num_per_pe = np.array(
+        [prefill_len_p_pe + len(range(py, total_steps, P)) for py in range(P)], dtype=int
+    )
 
-    # Build extended K/V cache: K_ext[kv_dim, prefill_len+1], V_ext[prefill_len+1, kv_dim]
-    # K_ext[:, t] = K for global token t.
-    # Global token t → PE py=t%P, slot t//P.
-    # XKCache[:, t] for t < prefill_len (interleaved, so XKCache[:, t] = K for token t).
-    # New token at t=prefill_len comes from K_new.
-    K_ext = np.zeros((kv_dim, prefill_len + 1), dtype=np.float32)
+    # Build extended K/V cache with all total_steps decode tokens.
+    # Since X is constant, every decode step produces the same K_new/V_new.
+    # Decode token at step s lands at global index prefill_len + s.
+    seq_len = prefill_len + total_steps
+    K_ext = np.zeros((kv_dim, seq_len), dtype=np.float32)
     K_ext[:, :prefill_len] = XKCache[:, :prefill_len].astype(np.float32)
-    K_ext[:, prefill_len] = K_new[0, :].astype(np.float32)  # bsz index 0 (first batch)
+    for s in range(total_steps):
+        K_ext[:, prefill_len + s] = K_new[0, :].astype(np.float32)
 
-    V_ext = np.zeros((prefill_len + 1, kv_dim), dtype=np.float32)
+    V_ext = np.zeros((seq_len, kv_dim), dtype=np.float32)
     V_ext[:prefill_len, :] = XVCache[:prefill_len, :].astype(np.float32)
-    V_ext[prefill_len, :] = V_new[0, :].astype(np.float32)
-
-    seq_len = prefill_len + 1  # total tokens for step 0
+    for s in range(total_steps):
+        V_ext[prefill_len + s, :] = V_new[0, :].astype(np.float32)
 
     # Step 4+5: Attention per Q-head over seq_len tokens (same logic as Phase 2)
     score_per_head = np.zeros((n_heads, bsz, seq_len), dtype=np.float32)
@@ -332,6 +335,8 @@ def parse_args():
                         help="Random seed for reproducibility")
     parser.add_argument("--validate", action="store_true",
                         help="Read intermediate buffers and compare against numpy reference")
+    parser.add_argument("--steps", type=int, default=1,
+                        help="Total decode steps to run (default 1). Each step appends one token to the KV cache.")
     return parser.parse_args()
 
 def main():
@@ -441,7 +446,7 @@ def main():
     tensor_XVCache = np.zeros((max_seq_len, kv_dim), dtype=np.float16)
     if args.simple:
         tensor_XKCache[:, :prefill_len] = np.full((kv_dim, prefill_len), 0.4, dtype=np.float16)
-        tensor_XVCache[:prefill_len, :] = np.full((prefill_len, kv_dim), 0.5, dtype=np.float16)
+        tensor_XVCache[:prefill_len, :] = np.full((prefill_len, kv_dim), 5, dtype=np.float16)
     else:
         tensor_XKCache[:, :prefill_len] = np.random.rand(kv_dim, prefill_len).astype(np.float16)
         tensor_XVCache[:prefill_len, :] = np.random.rand(prefill_len, kv_dim).astype(np.float16)
@@ -544,7 +549,7 @@ def main():
     # ─── Launch ───────────────────────────────────────────────────────────────
     runner.launch("init_task", nonblock=False)
 
-    repeat_steps = 1
+    repeat_steps = args.steps
     warmup_steps = 0
     runner.launch("decode_host", np.int16(repeat_steps), np.int16(warmup_steps), nonblock=False)
 
@@ -605,12 +610,13 @@ def main():
         tensor_XKCache, tensor_XVCache,
         P, n_heads, n_kv_heads, head_dim,
         dim_p_pe, kv_dim_p_pe, max_seq_len_p_pe, prefill_len_p_pe,
-        gqa_group_size, pes_p_kv_head
+        gqa_group_size, pes_p_kv_head,
+        total_steps=repeat_steps
     )
 
     iter_num_per_pe = ref['iter_num_per_pe']
     prefill_len_ref = P * prefill_len_p_pe
-    seq_len_ref     = prefill_len_ref + 1  # total tokens for step 0
+    seq_len_ref     = prefill_len_ref + repeat_steps  # total tokens after all steps
 
     all_ok = True
 
@@ -677,7 +683,8 @@ def main():
     # ── Build per-PE reference for step 5a and 5b (Phase 3: variable iter_num, all groups) ──
     # Layout mirrors device: iter_num-packed — group g at offset g*bsz*iters (stride=bsz*iters).
     # This matches the CSL score buffer where out_vector_dsd carries over between GEMV group calls.
-    # K_pe(px, py): slot s → token = py + s*P; prefill from tensor_XKCache, new token from K_new (py=0 only)
+    # K_pe(px, py): slot s → token = py + s*P; prefill from tensor_XKCache,
+    #   decode slots [prefill_len_p_pe..iters-1] all hold K_new (X constant across steps).
     alpha_val = np.float16(1.0 / np.sqrt(head_dim))
 
     score_5a_ref = np.zeros((P, P, bsz * gqa_group_size * max_seq_len_p_pe), dtype=np.float16)
@@ -688,8 +695,9 @@ def main():
             for s in range(min(iters, prefill_len_p_pe)):
                 token = py + s * P
                 K_pe[:, s] = tensor_XKCache[px * kv_dim_p_pe:(px + 1) * kv_dim_p_pe, token].astype(np.float32)
-            if iters > prefill_len_p_pe:  # py == 0: new token at slot prefill_len_p_pe
-                K_pe[:, prefill_len_p_pe] = ref['K_new'][0, px * kv_dim_p_pe:(px + 1) * kv_dim_p_pe].astype(np.float32)
+            # Decode slots: all have same K_new since X is constant across steps
+            for j in range(prefill_len_p_pe, iters):
+                K_pe[:, j] = ref['K_new'][0, px * kv_dim_p_pe:(px + 1) * kv_dim_p_pe].astype(np.float32)
             for g in range(gqa_group_size):
                 q_g = Q_perm_full[:, px * dim_p_pe + g * kv_dim_p_pe : px * dim_p_pe + (g + 1) * kv_dim_p_pe].astype(np.float32)
                 partial = (q_g @ K_pe).astype(np.float16)  # [bsz, iters]
@@ -718,7 +726,7 @@ def main():
 
     # ── Step 5a: post-GEMV (per-PE partial, before KV-head-scoped reduce) ────────
     sep(f"Step 5a — post-score GEMV  (all {gqa_group_size} groups per PE, before KV-head-scoped X-reduce)")
-    print(f"  Phase 3: iter_num per PE = {iter_num_per_pe.tolist()}  (prefill_len_p_pe={prefill_len_p_pe} + new token at py=0)")
+    print(f"  Phase 3: iter_num per PE = {iter_num_per_pe.tolist()}  (prefill_len_p_pe={prefill_len_p_pe} + {repeat_steps} decode step(s))")
     show_all("score_gemv_sim", score_gemv_grid)
     show_all("score_5a_ref",   score_5a_ref)
     for kv_head_i in range(n_kv_heads):
@@ -824,7 +832,7 @@ def main():
     sep("Validation Summary")
     print(f"  Config: P={P}  n_heads={n_heads}  n_kv_heads={n_kv_heads}  gqa_group_size={gqa_group_size}")
     print(f"          pes_p_head={pes_p_head}  pes_p_kv_head={pes_p_kv_head}  dim={dim}  kv_dim={kv_dim}")
-    print(f"          max_seq_len={max_seq_len}  prefill_len={prefill_len}  seq_len_for_step0={seq_len_ref}")
+    print(f"          max_seq_len={max_seq_len}  prefill_len={prefill_len}  seq_len_after_{repeat_steps}_steps={seq_len_ref}")
     print(f"          iter_num_per_pe={iter_num_per_pe.tolist()}")
     print(f"  simple={args.simple}  fill={args.fill}")
     print()

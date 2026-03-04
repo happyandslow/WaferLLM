@@ -876,7 +876,9 @@ fn output_matvec_mult_all_groups() void {
     for (@range(i16, gqa_group_size)) |_| {
         vecmat_computation_var_right(kv_dim_p_pe * max_seq_len_p_pe);
     }
-    // Y-reduce is deferred: done once after all gqa_group_size output GEMVs (caller's responsibility)
+
+    // Single Y-reduce covers all gqa_group_size sub-head outputs (full output_tile)
+    comm_mod.all_reduce_bsz_dim(py, quotient_y, remainder_y, ptr_output);
 }
 
 fn o_matvec_mult() void {
@@ -1042,10 +1044,9 @@ fn decode_struct() void {
 
     @fmovh(output_dsd, 0.0);
     softmax_score_all_groups();       // 2 Y-reduces total (1 max + 1 sum), batched over all groups
-    output_matvec_mult_all_groups();  // G local GEMVs, no sync
-    // Single Y-reduce covers all gqa_group_size sub-head outputs (full output_tile)
-    comm_mod.all_reduce_bsz_dim(py, quotient_y, remainder_y, ptr_output);
 
+    output_matvec_mult_all_groups();  // G local GEMVs, no sync
+    
     comm_mod.reconfig_allreduce_axis(0);
 
     o_matvec_mult();
