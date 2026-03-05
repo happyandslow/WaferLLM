@@ -127,16 +127,19 @@ def compute_reference(X, W_norm, W_Q_perm, W_K, W_V, freqs_cos, freqs_sin,
     score_scaled = (score_per_head * float(alpha)).astype(np.float16)
     attn_per_head = np.stack([softmax_csl(score_scaled[h]) for h in range(n_heads)])  # [n_heads, bsz, seq_len]
 
-    # Step 6: Output per head (same as Phase 2 but with V_ext)
+    # Step 6: Output per head — BATCH-OUTER layout [bsz, gqa_group_size, kv_dim_p_pe]
+    # output[b * dim_p_pe + g * kv_dim_p_pe : ... + kv_dim_p_pe] = attn[h,b] @ V
     output_grid = np.zeros((P, P, bsz * dim_p_pe), dtype=np.float32)
     for px in range(P):
         kv_head = px // pes_p_kv_head
         v_slice = V_ext[:, px * kv_dim_p_pe:(px + 1) * kv_dim_p_pe]  # [seq_len, kv_dim_p_pe]
         for g in range(gqa_group_size):
             h = kv_head * gqa_group_size + g
-            out_g = (attn_per_head[h].astype(np.float32) @ v_slice.astype(np.float32)).astype(np.float16)
-            for py in range(P):
-                output_grid[py, px, g * bsz * kv_dim_p_pe:(g + 1) * bsz * kv_dim_p_pe] = out_g.ravel()
+            out_g = (attn_per_head[h].astype(np.float32) @ v_slice.astype(np.float32)).astype(np.float16)  # [bsz, kv_dim_p_pe]
+            for b in range(bsz):
+                start = b * dim_p_pe + g * kv_dim_p_pe
+                for py in range(P):
+                    output_grid[py, px, start:start + kv_dim_p_pe] = out_g[b, :]
 
     return {
         'X_norm':           X_norm,
@@ -215,7 +218,8 @@ def reconstruct_QKV(qkv_grid, bsz, dim_p_pe, kv_dim_p_pe, P):
 
 def reconstruct_score(score_grid, bsz, max_seq_len_p_pe, P, n_heads, n_kv_heads, gqa_group_size, iter_num_per_pe=None):
     """
-    Phase 3: score_grid [P, P, gqa_group_size*bsz*max_seq_len_p_pe].
+    Phase 3: score_grid [P, P, bsz*gqa_group_size*max_seq_len_p_pe].
+    Score layout: BATCH-OUTER [bsz, gqa_group_size, iter_num].
     iter_num_per_pe: array of length P giving valid token count per PE-y.
     Returns attn [n_heads, bsz, total_tokens] assembled from per-PE valid slots.
     Total tokens = sum(iter_num_per_pe).
@@ -232,12 +236,12 @@ def reconstruct_score(score_grid, bsz, max_seq_len_p_pe, P, n_heads, n_kv_heads,
         px_kv = kv_head * pes_p_kv_head   # representative PE for KV-head
         for py in range(P):
             iters = iter_num_per_pe[py]
-            pe = score_grid[py, px_kv, :]  # [gqa_group_size * bsz * max_seq_len_p_pe]
+            pe = score_grid[py, px_kv, :]  # [bsz * gqa_group_size * max_seq_len_p_pe]
             for slot in range(iters):
                 t_global = py + slot * P
                 if t_global < total_tokens:
                     for b in range(bsz):
-                        idx = g * bsz * iters + b * iters + slot
+                        idx = b * gqa_group_size * iters + g * iters + slot  # batch-outer
                         attn[h, b, t_global] = pe[idx]
     return attn
 
@@ -400,9 +404,14 @@ def main():
         return np.random.rand(*shape).astype(np.float16)
 
     X_raw    = mk(1, bsz * dim, fill=.1)
+    for j in range(bsz):
+        for i in range(dim):
+            X_raw[0, j * dim + i] =0.1*( j + 1) # j + 1
+            #X[0, i*dim_p_pe*bsz + j*dim_p_pe : i*dim_p_pe*bsz + (j+1)*dim_p_pe] = i + 1 # j + 1
+    print(f"X_raw: {X_raw}")
     W_raw    = mk(1, dim, fill=args.fill)
 
-    tensor_q_weight  = mk_dim(dim, dim) * 0.1
+    tensor_q_weight  =mk(dim, dim, fill=.1)
     tensor_k_weight  = mk(dim, kv_dim, fill=.2)
     tensor_v_weight  = mk(dim, kv_dim, fill=.3)
 
@@ -445,8 +454,8 @@ def main():
     tensor_XKCache = np.zeros((kv_dim, max_seq_len), dtype=np.float16)
     tensor_XVCache = np.zeros((max_seq_len, kv_dim), dtype=np.float16)
     if args.simple:
-        tensor_XKCache[:, :prefill_len] = np.full((kv_dim, prefill_len), 0.4, dtype=np.float16)
-        tensor_XVCache[:prefill_len, :] = np.full((prefill_len, kv_dim), 5, dtype=np.float16)
+        tensor_XKCache[:, :prefill_len] = np.full((kv_dim, prefill_len), 0.04, dtype=np.float16)
+        tensor_XVCache[:prefill_len, :] = np.full((prefill_len, kv_dim), 0.05, dtype=np.float16)
     else:
         tensor_XKCache[:, :prefill_len] = np.random.rand(kv_dim, prefill_len).astype(np.float16)
         tensor_XVCache[:prefill_len, :] = np.random.rand(prefill_len, kv_dim).astype(np.float16)
@@ -469,7 +478,10 @@ def main():
             W_O_perm[_new_col:_new_col + kv_dim_p_pe, :] = tensor_o_weight[_old_col:_old_col + kv_dim_p_pe, :]
 
     # ─── Tile inputs for the PE grid ──────────────────────────────────────────
-    tensor_X = np.tile(X_raw.reshape(P, bsz * dim_p_pe), reps=(1, P))
+    # For bsz > 1: each PE row py must hold [X[0,py_slice], X[1,py_slice], ...].
+    # Correct: reshape to [bsz, P, dim_p_pe], transpose to [P, bsz, dim_p_pe], then flatten batch+feat.
+    X_per_pe = X_raw.reshape(bsz, P, dim_p_pe).transpose(1, 0, 2).reshape(P, bsz * dim_p_pe)
+    tensor_X = np.tile(X_per_pe, reps=(1, P))
     tensor_W = np.tile(W_raw.reshape(P, dim_p_pe), reps=(1, P))
 
     def tile_weight_row(W, rows, cols):
@@ -647,8 +659,8 @@ def main():
             proj_ref[py, px, bsz*dim_p_pe:bsz*(dim_p_pe+kv_dim_p_pe)] = k_p.ravel()
             proj_ref[py, px, bsz*(dim_p_pe+kv_dim_p_pe):] = v_p.ravel()
     proj_ref = proj_ref.astype(np.float16)
-    show("Q_sim  PE(0,0) partial", proj_grid[0, 0, :bsz*dim_p_pe].astype(np.float32))
-    show("Q_ref  PE(0,0) partial", proj_ref[0, 0, :bsz*dim_p_pe].astype(np.float32))
+    show_all("proj_sim", proj_grid)
+    show_all("proj_ref", proj_ref)
     all_ok &= cmp("Step2a Q-partial  sim vs ref", proj_grid[:,:,:bsz*dim_p_pe], proj_ref[:,:,:bsz*dim_p_pe])
     all_ok &= cmp("Step2a K-partial  sim vs ref", proj_grid[:,:,bsz*dim_p_pe:bsz*(dim_p_pe+kv_dim_p_pe)], proj_ref[:,:,bsz*dim_p_pe:bsz*(dim_p_pe+kv_dim_p_pe)])
     all_ok &= cmp("Step2a V-partial  sim vs ref", proj_grid[:,:,bsz*(dim_p_pe+kv_dim_p_pe):], proj_ref[:,:,bsz*(dim_p_pe+kv_dim_p_pe):])
@@ -664,8 +676,8 @@ def main():
             reduce_ref[py, px, :bsz*dim_p_pe] = Q_full[:, px*dim_p_pe:(px+1)*dim_p_pe].ravel()
             reduce_ref[py, px, bsz*dim_p_pe:bsz*(dim_p_pe+kv_dim_p_pe)] = K_full[:, px*kv_dim_p_pe:(px+1)*kv_dim_p_pe].ravel()
             reduce_ref[py, px, bsz*(dim_p_pe+kv_dim_p_pe):] = V_full[:, px*kv_dim_p_pe:(px+1)*kv_dim_p_pe].ravel()
-    show("Q_sim  PE(0,0) reduced", reduce_grid[0, 0, :bsz*dim_p_pe].astype(np.float32))
-    show("Q_ref  PE(0,0) reduced", reduce_ref[0, 0, :bsz*dim_p_pe].astype(np.float32))
+    show_all("reduce_sim", reduce_grid)
+    show_all("reduce_ref", reduce_ref)
     all_ok &= cmp("Step2b Q-reduced  sim vs ref", reduce_grid[:,:,:bsz*dim_p_pe], reduce_ref[:,:,:bsz*dim_p_pe])
     all_ok &= cmp("Step2b K-reduced  sim vs ref", reduce_grid[:,:,bsz*dim_p_pe:bsz*(dim_p_pe+kv_dim_p_pe)], reduce_ref[:,:,bsz*dim_p_pe:bsz*(dim_p_pe+kv_dim_p_pe)])
     all_ok &= cmp("Step2b V-reduced  sim vs ref", reduce_grid[:,:,bsz*(dim_p_pe+kv_dim_p_pe):], reduce_ref[:,:,bsz*(dim_p_pe+kv_dim_p_pe):])
@@ -681,12 +693,14 @@ def main():
     Q_perm_full = (ref['X_norm'].astype(np.float32) @ W_Q_perm.astype(np.float32)).astype(np.float16)
 
     # ── Build per-PE reference for step 5a and 5b (Phase 3: variable iter_num, all groups) ──
-    # Layout mirrors device: iter_num-packed — group g at offset g*bsz*iters (stride=bsz*iters).
-    # This matches the CSL score buffer where out_vector_dsd carries over between GEMV group calls.
+    # Layout mirrors device: BATCH-OUTER [bsz, gqa_group_size, iter_num].
+    #   base(b,g) = b * gqa_group_size * iters + g * iters.
     # K_pe(px, py): slot s → token = py + s*P; prefill from tensor_XKCache,
     #   decode slots [prefill_len_p_pe..iters-1] all hold K_new (X constant across steps).
     alpha_val = np.float16(1.0 / np.sqrt(head_dim))
 
+    # Score layout: BATCH-OUTER [bsz, gqa_group_size, iter_num]
+    #   base(b,g) = b * gqa_group_size * iters + g * iters
     score_5a_ref = np.zeros((P, P, bsz * gqa_group_size * max_seq_len_p_pe), dtype=np.float16)
     for py in range(P):
         iters = iter_num_per_pe[py]
@@ -702,10 +716,10 @@ def main():
                 q_g = Q_perm_full[:, px * dim_p_pe + g * kv_dim_p_pe : px * dim_p_pe + (g + 1) * kv_dim_p_pe].astype(np.float32)
                 partial = (q_g @ K_pe).astype(np.float16)  # [bsz, iters]
                 for b in range(bsz):
-                    base = g * bsz * iters + b * iters      # iter_num-packed, matches device
+                    base = b * gqa_group_size * iters + g * iters  # batch-outer layout
                     score_5a_ref[py, px, base : base + iters] = partial[b, :]
 
-    # score_5b_ref: after KV-head-scoped X-reduce + alpha scale (all groups, iter_num-packed)
+    # score_5b_ref: after KV-head-scoped X-reduce + alpha scale (all groups, batch-outer)
     score_5b_ref = np.zeros((P, P, bsz * gqa_group_size * max_seq_len_p_pe), dtype=np.float16)
     for py in range(P):
         iters = iter_num_per_pe[py]
@@ -714,12 +728,12 @@ def main():
                 kv_sum = np.zeros((bsz, iters), dtype=np.float32)
                 for px in range(kv_head_i * pes_p_kv_head, (kv_head_i + 1) * pes_p_kv_head):
                     for b in range(bsz):
-                        base = g * bsz * iters + b * iters
+                        base = b * gqa_group_size * iters + g * iters  # batch-outer
                         kv_sum[b, :] += score_5a_ref[py, px, base : base + iters].astype(np.float32)
                 kv_sum_scaled = (kv_sum * float(alpha_val)).astype(np.float16)
                 for px in range(kv_head_i * pes_p_kv_head, (kv_head_i + 1) * pes_p_kv_head):
                     for b in range(bsz):
-                        base = g * bsz * iters + b * iters
+                        base = b * gqa_group_size * iters + g * iters  # batch-outer
                         score_5b_ref[py, px, base : base + iters] = kv_sum_scaled[b, :]
 
     show_all("qkv_grid", qkv_grid)
@@ -735,7 +749,7 @@ def main():
             for py in range(P):
                 iters = iter_num_per_pe[py]
                 for b in range(bsz):
-                    base = g * bsz * iters + b * iters      # iter_num-packed (both sim and ref)
+                    base = b * gqa_group_size * iters + g * iters  # batch-outer
                     all_ok &= cmp(
                         f"Step5a score_post_gemv kv_head={kv_head_i} g={g} py={py} b={b} (px={px0})",
                         score_gemv_grid[py, px0, base : base + iters],
@@ -752,7 +766,7 @@ def main():
             for py in range(P):
                 iters = iter_num_per_pe[py]
                 for b in range(bsz):
-                    base = g * bsz * iters + b * iters      # iter_num-packed (both sim and ref)
+                    base = b * gqa_group_size * iters + g * iters  # batch-outer
                     all_ok &= cmp(
                         f"Step5b score_post_reduce kv_head={kv_head_i} g={g} py={py} b={b}",
                         score_reduce_grid[py, px0, base : base + iters],
@@ -783,7 +797,7 @@ def main():
                     for slot in range(iters):
                         t_global = py + slot * P
                         if t_global < seq_len_ref:
-                            attn_ref_grid[py, px, g * bsz * iters + b * iters + slot] = ref['attn_per_head'][h, b, t_global]
+                            attn_ref_grid[py, px, b * gqa_group_size * iters + g * iters + slot] = ref['attn_per_head'][h, b, t_global]
 
     show_all("attn_sim", score_grid)
     show_all("attn_ref", attn_ref_grid)
@@ -795,7 +809,7 @@ def main():
             for py in range(P):
                 iters = iter_num_per_pe[py]
                 for b in range(bsz):
-                    base = g * bsz * iters + b * iters
+                    base = b * gqa_group_size * iters + g * iters  # batch-outer
                     all_ok &= cmp(
                         f"Step5c attn kv_head={kv_head_i} g={g} py={py} b={b}",
                         score_grid[py, px0, base : base + iters],
@@ -808,8 +822,8 @@ def main():
             for b in range(bsz):
                 s_sim = sum(
                     float(np.sum(score_grid[py, px0,
-                        g * bsz * iter_num_per_pe[py] + b * iter_num_per_pe[py] :
-                        g * bsz * iter_num_per_pe[py] + (b + 1) * iter_num_per_pe[py]
+                        b * gqa_group_size * iter_num_per_pe[py] + g * iter_num_per_pe[py] :
+                        b * gqa_group_size * iter_num_per_pe[py] + g * iter_num_per_pe[py] + iter_num_per_pe[py]
                     ].astype(np.float32)))
                     for py in range(P)
                 )
