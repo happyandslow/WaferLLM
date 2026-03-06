@@ -3,7 +3,7 @@
 SdkLauncher script for Decode WSE-3 module.
 
 Dispatches a pre-compiled artifact to the appliance via SdkLauncher,
-stages the host execution script (launch_wse3.py) and config file,
+stages the host execution script (launch_sim.py) and config file,
 then runs the host code on the appliance.
 
 Prerequisites:
@@ -63,9 +63,10 @@ def main():
 
     config_basename = os.path.basename(args.config)
 
-    run_cmd = f"python launch_wse3.py --config {config_basename} --artifact-id {artifact_id}"
-    if args.simulator:
-        run_cmd += " --simulator"
+    run_cmd = (
+        f"cs_python launch_sim.py --config {config_basename} "
+        f"--cmaddr %CMADDR%"
+    )
 
     print(f"=== Decode WSE-3: SdkLauncher Dispatch ===")
     print(f"Config       : {args.config}")
@@ -76,7 +77,7 @@ def main():
 
     with SdkLauncher(artifact_id, simulator=args.simulator,
                      disable_version_check=True) as launcher:
-        launcher.stage("launch_wse3.py")
+        launcher.stage("launch_sim.py")
         launcher.stage(args.config)
 
         print(f"Executing on appliance...")

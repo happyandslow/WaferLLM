@@ -60,12 +60,13 @@ def main():
     os.makedirs(staging_dir)
 
     shutil.copytree("out", os.path.join(staging_dir, "out"))
-    shutil.copy2("launch_wse3.py", staging_dir)
+    shutil.copy2("launch_sim.py", staging_dir)
     shutil.copy2(args.config, staging_dir)
 
-    run_cmd = f"python launch_wse3.py --config {config_basename} --artifact-id out"
-    if args.simulator:
-        run_cmd += " --simulator"
+    run_cmd = (
+        f"cs_python launch_sim.py --config {config_basename} "
+        f"--cmaddr %CMADDR%"
+    )
 
     print(f"=== Decode WSE-3-GQA: SdkLauncher Dispatch ===")
     print(f"Config       : {args.config}")

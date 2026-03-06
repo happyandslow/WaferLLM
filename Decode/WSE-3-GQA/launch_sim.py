@@ -341,6 +341,8 @@ def parse_args():
                         help="Read intermediate buffers and compare against numpy reference")
     parser.add_argument("--steps", type=int, default=1,
                         help="Total decode steps to run (default 1). Each step appends one token to the KV cache.")
+    parser.add_argument("--cmaddr", type=str, default=None,
+                        help="CM address for hardware execution (via SdkLauncher)")
     return parser.parse_args()
 
 def main():
@@ -503,7 +505,10 @@ def main():
     VCache_tile = tile_vcache_interleaved(tensor_XVCache, P, kv_dim_p_pe, max_seq_len_p_pe, prefill_len_p_pe)
 
     # ─── Runner ───────────────────────────────────────────────────────────────
-    runner = SdkRuntime("out", simfab_numthreads=64, msg_level='INFO')
+    if args.cmaddr:
+        runner = SdkRuntime("out", cmaddr=args.cmaddr)
+    else:
+        runner = SdkRuntime("out", simfab_numthreads=64, msg_level='INFO')
     runner.load()
     runner.run()
 

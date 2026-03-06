@@ -3,7 +3,7 @@
 SdkLauncher script for Decode WSE-3-KV module.
 
 Dispatches a pre-compiled artifact to the appliance via SdkLauncher,
-stages the host execution script (launch_wse3.py) and config file,
+stages the host execution script (launch_sim.py) and config file,
 then runs the host code on the appliance.
 
 Prerequisites:
@@ -45,7 +45,7 @@ def main():
     )
     parser.add_argument(
         "--once", action="store_true",
-        help="Use launch_wse3_once.py instead of launch_wse3.py"
+        help="(ignored, kept for CLI compatibility)"
     )
     args = parser.parse_args()
 
@@ -75,32 +75,22 @@ def main():
         artifact_id = json.load(f)["artifact_id"]
 
     config_basename = os.path.basename(args.config)
-    launch_script = "launch_wse3_once.py" if args.once else "launch_wse3.py"
 
     run_cmd = (
-        f"python {launch_script} --config {config_basename} "
-        f"--artifact-id {artifact_id} "
-        f"--warmup {args.warmup} --repeat {args.repeat}"
+        f"cs_python launch_sim.py --config {config_basename} "
+        f"--cmaddr %CMADDR%"
     )
-    if args.simulator:
-        run_cmd += " --simulator"
 
     print(f"=== Decode WSE-3-KV: SdkLauncher Dispatch ===")
     print(f"Config       : {args.config}")
     print(f"Artifact     : {artifact_id}")
     print(f"Simulator    : {args.simulator}")
-    print(f"Launch script: {launch_script}")
-    print(f"Warmup       : {args.warmup}")
-    print(f"Repeat       : {args.repeat}")
     print(f"Run command  : {run_cmd}")
     print()
 
     with SdkLauncher(artifact_id, simulator=args.simulator,
                      disable_version_check=True) as launcher:
-        launcher.stage(launch_script)
-        if args.once and launch_script != "launch_wse3.py":
-            # Also stage the other script in case it's needed
-            pass
+        launcher.stage("launch_sim.py")
         launcher.stage(args.config)
 
         print(f"Executing on appliance...")

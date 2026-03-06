@@ -31,6 +31,8 @@ class Config:
 def parse_args():
     parser = argparse.ArgumentParser(description="Move to right unit test")
     parser.add_argument("--config", default="config.json", type=str, help="Config file")
+    parser.add_argument("--cmaddr", type=str, default=None,
+                        help="CM address for hardware execution (via SdkLauncher)")
     args = parser.parse_args()
     return args
 
@@ -94,7 +96,10 @@ def main():
     tensor_down_weight = np.random.rand(ffn_dim, dim).astype(np.float16)
 
     # runner = SdkRuntime("out", suppress_simfab_trace=True, simfab_numthreads=64, msg_level='INFO')
-    runner = SdkRuntime("out", simfab_numthreads=64, msg_level='INFO')
+    if args.cmaddr:
+        runner = SdkRuntime("out", cmaddr=args.cmaddr)
+    else:
+        runner = SdkRuntime("out", simfab_numthreads=64, msg_level='INFO')
 
     runner.load()
     runner.run()
