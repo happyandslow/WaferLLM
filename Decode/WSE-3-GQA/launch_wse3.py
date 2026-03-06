@@ -30,6 +30,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Move to right unit test")
     parser.add_argument("--config", default="config.json", type=str, help="Config file")
     parser.add_argument("--simulator", action="store_true", help="Runs on simulator")
+    parser.add_argument("--artifact-id", type=str, default=None,
+                        help="Artifact ID (overrides compile_out JSON lookup)")
     args = parser.parse_args()
     return args
 
@@ -92,9 +94,12 @@ def main():
     tensor_gate_weight = np.random.rand(dim, ffn_dim).astype(np.float16)
     tensor_down_weight = np.random.rand(ffn_dim, dim).astype(np.float16)
     
-    with open(f"{out_path}/artifact_{P}_{P//pe_num_p_group}.json", "r", encoding="utf8") as f:
-        data = json.load(f)
-        artifact_path = data["artifact_id"]
+    if args.artifact_id:
+        artifact_path = args.artifact_id
+    else:
+        with open(f"{out_path}/artifact_{P}_{P//pe_num_p_group}.json", "r", encoding="utf8") as f:
+            data = json.load(f)
+            artifact_path = data["artifact_id"]
 
     with SdkRuntime(artifact_path, simulator=args.simulator) as runner:
         
