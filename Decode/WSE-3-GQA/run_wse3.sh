@@ -68,7 +68,7 @@ echo "ROOT_2ND_PHASE: $root_2nd_phase"
 
 echo "Simulator: $simulator"
 
-python compile.py $P $BSZ $dim_p_pe $pes_p_head $pes_p_kv_head $head_dim_p_pe $seq_len_p_pe $ffn_dim_p_pe $pe_num_p_group $root_1st_phase $root_2nd_phase $simulator
+python compile.py $CONFIG $simulator
 
 if [ "$simulator" == "true" ]; then
     python launch_wse3.py --config $CONFIG --simulator

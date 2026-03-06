@@ -1,8 +1,8 @@
-# Decode
+# Decode WSE-3-GQA
 
 ## Overview
 
-This folder contains the implementation of the **Decode** algorithm for transformer model inference on Cerebras WSE-3.
+Grouped-Query Attention (GQA) decode kernel for transformer inference on Cerebras WSE-3. Extends the base WSE-3 decode with compact KV caches, interleaved Q layout (Option C), and KV-head-scoped all-reduce.
 
 ## Platform
 
@@ -12,52 +12,104 @@ This folder contains the implementation of the **Decode** algorithm for transfor
 
 ## Configuration
 
-The Decode implementation uses JSON configuration files to specify model parameters. Example configuration files can be found in `model_config/`.
+Configuration files are in `model_config/`. Example (`gqa_test.json`):
 
-**Configuration Parameters:**
-- `P`: Number of PEs in each dimension (creates P×P PE grid)
-- `group_num`: Number of PE groups for parallel execution
-- `bsz`: Batch size
-- `dim`: Model hidden dimension
-- `n_heads`: Number of attention heads
-- `n_kv_heads`: Number of key-value heads (for grouped-query attention)
-- `head_dim`: Dimension per attention head
-- `seq_len`: Maximum sequence length
-- `ffn_dim`: Feed-forward network hidden dimension
+```json
+{
+    "P": 8,
+    "group_num": 4,
+    "bsz": 2,
+    "dim": 16,
+    "n_heads": 4,
+    "n_kv_heads": 2,
+    "head_dim": 4,
+    "max_seq_len": 16,
+    "prefill_len": 8,
+    "ffn_dim": 64
+}
+```
+
+**Parameters:**
+| Parameter | Description |
+|-----------|-------------|
+| `P` | PE grid dimension (creates P x P grid) |
+| `group_num` | Number of PE groups for communication |
+| `bsz` | Batch size |
+| `dim` | Model hidden dimension |
+| `n_heads` | Number of query attention heads |
+| `n_kv_heads` | Number of key-value heads (GQA groups) |
+| `head_dim` | Dimension per attention head |
+| `max_seq_len` | Maximum sequence length (KV cache capacity) |
+| `prefill_len` | Number of prefilled tokens in KV cache |
+| `ffn_dim` | Feed-forward network hidden dimension |
+
+**Constraints:**
+- All dimensions must be divisible by `P`
+- `group_num` must be a multiple of both `n_heads` and `n_kv_heads`
+- `prefill_len` must be divisible by `P`
+- `max_seq_len >= prefill_len`
 
 ## Run with Simulator
 
-The simulator allows you to test and debug your Decode implementation before deploying to actual hardware.
-
 ```bash
-# bash ./run_sim.sh [config_file]
-# If no config file is specified, uses config.json or default values
-# Example with test configuration
-bash ./run_sim.sh model_config/test.json
+bash run_sim.sh model_config/gqa_test.json
 ```
 
-**Note:** The simulator provides cycle-accurate performance estimates and allows debugging without consuming actual hardware resources.
+## Run on WSE-3 Hardware
 
-## Run with Cerebras
-
-Deploy and execute your Decode algorithm on the actual WSE-3 hardware.
+### Direct execution (via SdkCompiler + SdkRuntime)
 
 ```bash
-# bash ./run_wse3.sh [config_file] [true for simulator | false for real device]
-# If no config file is specified, uses config.json or default values
-# Example with test configuration
-bash ./run_wse3.sh model_config/test.json true # For appliance simulator
-bash ./run_wse3.sh model_config/test.json false # Runing on real WSE-3
+# Compile + run on appliance simulator
+bash run_wse3.sh model_config/gqa_test.json true
+
+# Compile + run on real WSE-3
+bash run_wse3.sh model_config/gqa_test.json false
 ```
 
-**Prerequisites:**
-- Ensure you have access to a WSE-3 system
-- Verify your environment is properly configured with Cerebras SDK
-- Check that you have the necessary permissions to run on hardware
+### Via SdkLauncher (compile locally, dispatch to appliance)
 
-**Performance Considerations:**
-- The WSE-3 provides massive parallelism with thousands of cores
-- Optimal performance is achieved when dimensions are divisible by P
-- Consider memory constraints when selecting batch size and sequence length
-- Decode phase is memory-bandwidth bound, so efficient data layout is crucial
-- The `group_num` parameter allows for a trade-off between routing resources and allreduce latency
+```bash
+# Step 1: Compile (uses cslc)
+python compile.py model_config/gqa_test.json false
+
+# Step 2: Dispatch to appliance
+python run_sdk_launcher.py --config model_config/gqa_test.json
+
+# Or do both in one command:
+bash run_launcher.sh model_config/gqa_test.json
+
+# With appliance simulator:
+bash run_launcher.sh model_config/gqa_test.json true
+```
+
+### Compilation only
+
+```bash
+# For simulator (small fabric)
+python compile.py model_config/gqa_test.json true
+
+# For hardware (full 762x1172 fabric, 4 channels)
+python compile.py model_config/gqa_test.json false
+```
+
+## File Structure
+
+```
+WSE-3-GQA/
+├── src/
+│   ├── layout.csl              # PE grid configuration
+│   ├── decode.csl              # GQA decode kernel
+│   └── comm_lib/               # Communication library
+│       ├── comm_layout.csl     # Routing topology (incl. KV-head-scoped routes)
+│       └── comm_pe.csl         # PE-level comm primitives
+├── model_config/               # JSON config files
+├── compile.py                  # Compilation script (cslc subprocess)
+├── launch_sim.py               # Simulator host code
+├── launch_wse3.py              # Hardware host code (SdkRuntime)
+├── run_sdk_launcher.py         # SdkLauncher dispatch script
+├── run_sim.sh                  # Simulator workflow
+├── run_wse3.sh                 # Hardware workflow (direct)
+├── run_launcher.sh             # Hardware workflow (SdkLauncher)
+└── validate.py                 # Output validation
+```

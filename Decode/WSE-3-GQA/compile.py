@@ -1,45 +1,77 @@
 import os
-import signal
 import sys
 import json
 import time
-from cerebras.sdk.client import SdkCompiler
+import subprocess
 
-P = int(sys.argv[1])
-bsz = int(sys.argv[2])
-dim_p_pe = int(sys.argv[3])
-pes_p_head = int(sys.argv[4])
-pes_p_kv_head = int(sys.argv[5])
-head_dim_p_pe = int(sys.argv[6])
-seq_len_p_pe = int(sys.argv[7])
-ffn_dim_p_pe = int(sys.argv[8])
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python compile.py <config.json> [simulator=false]", file=sys.stderr)
+        sys.exit(1)
 
-pe_num_p_group = int(sys.argv[9])
-root_1st_phase = int(sys.argv[10])
-root_2nd_phase = int(sys.argv[11])
-simulator = sys.argv[12].lower() == "true"
+    config_path = sys.argv[1]
+    simulator = sys.argv[2].lower() == "true" if len(sys.argv) > 2 else False
 
-out_path = "compile_out"
+    with open(config_path, "r", encoding="utf8") as f:
+        config = json.load(f)
 
-print("Start compiling: "+time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time())), flush=True)
+    P = config["P"]
+    bsz = config["bsz"]
+    group_num = config["group_num"]
+    dim = config["dim"]
+    n_heads = config["n_heads"]
+    n_kv_heads = config["n_kv_heads"]
+    head_dim = config["head_dim"]
+    max_seq_len = config["max_seq_len"]
+    prefill_len = config["prefill_len"]
+    ffn_dim = config["ffn_dim"]
 
-if simulator:
-    ARGS=f"--arch=wse3 --fabric-dims={P+7},{P+2} --fabric-offsets=4,1 -o out --memcpy --channels=1 --params=P:{P},bsz:{bsz},dim_p_pe:{dim_p_pe},pes_p_head:{pes_p_head},pes_p_kv_head:{pes_p_kv_head},head_dim_p_pe:{head_dim_p_pe},seq_len_p_pe:{seq_len_p_pe},ffn_dim_p_pe:{ffn_dim_p_pe},pe_num_p_group:{pe_num_p_group},root_1st_phase:{root_1st_phase},root_2nd_phase:{root_2nd_phase}"
-else:
-    ARGS=f"--arch=wse3 --fabric-dims=762,1172 --fabric-offsets=4,1 -o out --memcpy --channels=4 --params=P:{P},bsz:{bsz},dim_p_pe:{dim_p_pe},pes_p_head:{pes_p_head},pes_p_kv_head:{pes_p_kv_head},head_dim_p_pe:{head_dim_p_pe},seq_len_p_pe:{seq_len_p_pe},ffn_dim_p_pe:{ffn_dim_p_pe},pe_num_p_group:{pe_num_p_group},root_1st_phase:{root_1st_phase},root_2nd_phase:{root_2nd_phase}"
+    dim_p_pe = dim // P
+    kv_dim_p_pe = (n_kv_heads * head_dim) // P
+    pes_p_head = P // n_heads
+    pes_p_kv_head = P // n_kv_heads
+    head_dim_p_pe = head_dim // P
+    max_seq_len_p_pe = max_seq_len // P
+    prefill_len_p_pe = prefill_len // P
+    ffn_dim_p_pe = ffn_dim // P
+    pe_num_p_group = P // group_num
+    root_1st_phase = pe_num_p_group // 2
+    root_2nd_phase = (group_num // 2) * pe_num_p_group + root_1st_phase
 
-# Instantiate copmiler
-with SdkCompiler(resource_cpu=48000, resource_mem=64<<30) as compiler:
+    if simulator:
+        fabric_w = P + 7
+        fabric_h = P + 2
+        channels = 1
+    else:
+        fabric_w = 762
+        fabric_h = 1172
+        channels = 4
 
-    artifact_id = compiler.compile(
-        app_path="src",
-        csl_main="layout.csl",
-        options=ARGS,
-        out_path=out_path,
+    params = (
+        f"P:{P},bsz:{bsz},"
+        f"dim_p_pe:{dim_p_pe},kv_dim_p_pe:{kv_dim_p_pe},"
+        f"pes_p_head:{pes_p_head},pes_p_kv_head:{pes_p_kv_head},"
+        f"head_dim_p_pe:{head_dim_p_pe},head_dim:{head_dim},"
+        f"max_seq_len_p_pe:{max_seq_len_p_pe},prefill_len_p_pe:{prefill_len_p_pe},"
+        f"ffn_dim_p_pe:{ffn_dim_p_pe},"
+        f"pe_num_p_group:{pe_num_p_group},"
+        f"root_1st_phase:{root_1st_phase},root_2nd_phase:{root_2nd_phase}"
     )
 
-    # Write the artifact_id to a JSON file
-    with open(f"{out_path}/artifact_{P}_{P//pe_num_p_group}.json", "w", encoding="utf-8") as f:
-        json.dump({"artifact_id": artifact_id,}, f)
+    cmd = (
+        f"cslc --arch=wse3 ./src/layout.csl "
+        f"--fabric-dims={fabric_w},{fabric_h} --fabric-offsets=4,1 "
+        f"--params={params} "
+        f"-o out --memcpy --channels {channels}"
+    )
 
-print("End compiling: "+time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time())), flush=True)
+    print(f"Start compiling: {time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    print(f"Command: {cmd}", flush=True)
+
+    result = subprocess.run(cmd, shell=True, check=True)
+
+    print(f"End compiling: {time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -22,34 +22,13 @@ if [ -f $CONFIG ]; then
     N_HEADS=$(jq -r '.n_heads' $CONFIG)
     N_KV_HEADS=$(jq -r '.n_kv_heads' $CONFIG)
     HEAD_DIM=$(jq -r '.head_dim' $CONFIG)
-    SEQ_LEN=$(jq -r '.seq_len' $CONFIG)
+    MAX_SEQ_LEN=$(jq -r '.max_seq_len' $CONFIG)
+    PREFILL_LEN=$(jq -r '.prefill_len' $CONFIG)
     FFN_DIM=$(jq -r '.ffn_dim' $CONFIG)
 else
-    echo "Use default test values."
-    P=8
-    GROUP_NUM=2
-    BSZ=1
-    DIM=64
-    N_HEADS=1
-    N_KV_HEADS=1
-    HEAD_DIM=64
-    SEQ_LEN=64
-    FFN_DIM=64
+    echo "Error: config file not found: $CONFIG"
+    exit 1
 fi
-
-FABRIC_W=$(($P + 7))
-FABRIC_H=$(($P + 2))
-
-dim_p_pe=$(($DIM / $P))
-pes_p_head=$(($P / $N_HEADS))
-pes_p_kv_head=$(($P / $N_KV_HEADS))
-head_dim_p_pe=$(($HEAD_DIM / $P))
-seq_len_p_pe=$(($SEQ_LEN / $P))
-ffn_dim_p_pe=$(($FFN_DIM / $P))
-pe_num_p_group=$(($P / $GROUP_NUM))
-
-root_1st_phase=$((pe_num_p_group / 2))
-root_2nd_phase=$(((($GROUP_NUM / 2) * pe_num_p_group) + root_1st_phase))
 
 echo "P: $P"
 echo "BSZ: $BSZ"
@@ -57,18 +36,26 @@ echo "DIM: $DIM"
 echo "N_HEADS: $N_HEADS"
 echo "N_KV_HEADS: $N_KV_HEADS"
 echo "HEAD_DIM: $HEAD_DIM"
-echo "SEQ_LEN: $SEQ_LEN"
+echo "MAX_SEQ_LEN: $MAX_SEQ_LEN"
+echo "PREFILL_LEN: $PREFILL_LEN"
 echo "FFN_DIM: $FFN_DIM"
-
 echo "GROUP_NUM: $GROUP_NUM"
-echo "PE_NUM_PER_GROUP: $pe_num_p_group"
-echo "ROOT_1ST_PHASE: $root_1st_phase"
-echo "ROOT_2ND_PHASE: $root_2nd_phase"
-
 echo "Simulator: $simulator"
 
-# Step 1: Compile using SdkCompiler
-python compile.py $P $BSZ $dim_p_pe $pes_p_head $pes_p_kv_head $head_dim_p_pe $seq_len_p_pe $ffn_dim_p_pe $pe_num_p_group $root_1st_phase $root_2nd_phase $simulator
+# Validate: group_num must be a multiple of n_heads
+if [ $(( GROUP_NUM % N_HEADS )) -ne 0 ]; then
+    echo "ERROR: group_num ($GROUP_NUM) must be a multiple of n_heads ($N_HEADS)"
+    exit 1
+fi
+
+# Validate: group_num must be a multiple of n_kv_heads
+if [ $(( GROUP_NUM % N_KV_HEADS )) -ne 0 ]; then
+    echo "ERROR: group_num ($GROUP_NUM) must be a multiple of n_kv_heads ($N_KV_HEADS)"
+    exit 1
+fi
+
+# Step 1: Compile using cslc
+python compile.py $CONFIG $simulator
 
 # Step 2: Dispatch to appliance via SdkLauncher
 if [ "$simulator" == "true" ]; then
