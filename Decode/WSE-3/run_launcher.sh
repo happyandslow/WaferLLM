@@ -67,8 +67,8 @@ echo "ROOT_2ND_PHASE: $root_2nd_phase"
 
 echo "Simulator: $simulator"
 
-# Step 1: Compile using SdkCompiler
-python compile.py $P $BSZ $dim_p_pe $pes_p_head $pes_p_kv_head $head_dim_p_pe $seq_len_p_pe $ffn_dim_p_pe $pe_num_p_group $root_1st_phase $root_2nd_phase $simulator
+# Step 1: Compile using cslc
+python compile.py $CONFIG $simulator
 
 # Step 2: Dispatch to appliance via SdkLauncher
 if [ "$simulator" == "true" ]; then
