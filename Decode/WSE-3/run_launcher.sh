@@ -12,6 +12,12 @@ if [ -n "$2" ]; then
     simulator=$2
 fi
 
+STEPS=1
+
+if [ -n "$3" ]; then
+    STEPS=$3
+fi
+
 # if config.json exists
 if [ -f $CONFIG ]; then
     echo "Use config values from $CONFIG."
@@ -66,13 +72,14 @@ echo "ROOT_1ST_PHASE: $root_1st_phase"
 echo "ROOT_2ND_PHASE: $root_2nd_phase"
 
 echo "Simulator: $simulator"
+echo "Steps: $STEPS"
 
 # Step 1: Compile using cslc
 python compile.py $CONFIG $simulator
 
 # Step 2: Dispatch to appliance via SdkLauncher
 if [ "$simulator" == "true" ]; then
-    python run_sdk_launcher.py --config $CONFIG --simulator
+    python run_sdk_launcher.py --config $CONFIG --simulator --steps $STEPS
 else
-    python run_sdk_launcher.py --config $CONFIG
+    python run_sdk_launcher.py --config $CONFIG --steps $STEPS
 fi

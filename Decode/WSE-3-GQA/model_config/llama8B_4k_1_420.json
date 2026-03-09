@@ -6,7 +6,8 @@
     "n_heads": 1,
     "n_kv_heads": 1,
     "head_dim": 4200,
-    "seq_len": 4200,
+    "max_seq_len": 8400,
+    "prefill_len": 4200,
     "ffn_dim": 14700,
     "layer_num": 32
 }

@@ -33,6 +33,8 @@ def parse_args():
     parser.add_argument("--config", default="config.json", type=str, help="Config file")
     parser.add_argument("--cmaddr", type=str, default=None,
                         help="CM address for hardware execution (via SdkLauncher)")
+    parser.add_argument("--steps", type=int, default=1,
+                        help="Total decode steps to run (default 1)")
     args = parser.parse_args()
     return args
 
@@ -232,7 +234,7 @@ def main():
     # -------------------------------------------------------------------------- #
     runner.launch("init_task", nonblock=False)
     
-    repeat_steps = 1
+    repeat_steps = args.steps
     warmup_steps = 0
     runner.launch("decode_host", np.int16(repeat_steps), np.int16(warmup_steps), nonblock=False)
     

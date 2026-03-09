@@ -34,6 +34,10 @@ def main():
         "--simulator", action="store_true",
         help="Run in appliance simulator mode"
     )
+    parser.add_argument(
+        "--steps", type=int, default=1,
+        help="Total decode steps to run (default 1)"
+    )
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -65,7 +69,7 @@ def main():
 
     run_cmd = (
         f"cs_python launch_sim.py --config {config_basename} "
-        f"--cmaddr %CMADDR%"
+        f"--steps {args.steps} --cmaddr %CMADDR%"
     )
 
     print(f"=== Decode WSE-3-GQA: SdkLauncher Dispatch ===")

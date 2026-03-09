@@ -12,6 +12,12 @@ if [ -n "$2" ]; then
     simulator=$2
 fi
 
+STEPS=1
+
+if [ -n "$3" ]; then
+    STEPS=$3
+fi
+
 # if config.json exists
 if [ -f $CONFIG ]; then
     echo "Use config values from $CONFIG."
@@ -41,6 +47,7 @@ echo "PREFILL_LEN: $PREFILL_LEN"
 echo "FFN_DIM: $FFN_DIM"
 echo "GROUP_NUM: $GROUP_NUM"
 echo "Simulator: $simulator"
+echo "Steps: $STEPS"
 
 # Validate: group_num must be a multiple of n_heads
 if [ $(( GROUP_NUM % N_HEADS )) -ne 0 ]; then
@@ -59,7 +66,7 @@ python compile.py $CONFIG $simulator
 
 # Step 2: Dispatch to appliance via SdkLauncher
 if [ "$simulator" == "true" ]; then
-    python run_sdk_launcher.py --config $CONFIG --simulator
+    python run_sdk_launcher.py --config $CONFIG --simulator --steps $STEPS
 else
-    python run_sdk_launcher.py --config $CONFIG
+    python run_sdk_launcher.py --config $CONFIG --steps $STEPS
 fi
