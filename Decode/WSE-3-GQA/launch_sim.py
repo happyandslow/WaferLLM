@@ -65,12 +65,12 @@ def compute_reference(X, W_norm, W_Q_perm, W_K, W_V, freqs_cos, freqs_sin,
                       gqa_group_size, pes_p_kv_head, total_steps=1):
     """
     Phase 3 reference for the final decode step after total_steps steps.
-    XKCache: [kv_dim, max_seq_len] — only cols 0..prefill_len-1 valid (interleaved).
-    XVCache: [max_seq_len, kv_dim] — only rows 0..prefill_len-1 valid (interleaved).
-    Interleaved layout: XKCache[:, t] is for global token t (PE py=t%P, slot t//P).
+    XKCache: [bsz, kv_dim, max_seq_len] — per-batch, only cols 0..prefill_len-1 valid.
+    XVCache: [bsz, max_seq_len, kv_dim] — per-batch, only rows 0..prefill_len-1 valid.
+    Interleaved layout: XKCache[b, :, t] is K for batch b, global token t.
     After total_steps decode steps: each step s writes to PE py=s%P at slot
       prefill_len_p_pe + s//P.  Since X is constant across steps, K_new and V_new
-    are identical for every decode step.
+    are identical for every decode step (but differ per batch element).
     Returns dict with iter_num_per_pe, attn_per_head, output_grid, etc.
     """
     kv_dim = n_kv_heads * head_dim
@@ -97,21 +97,23 @@ def compute_reference(X, W_norm, W_Q_perm, W_K, W_V, freqs_cos, freqs_sin,
         [prefill_len_p_pe + len(range(py, total_steps, P)) for py in range(P)], dtype=int
     )
 
-    # Build extended K/V cache with all total_steps decode tokens.
-    # Since X is constant, every decode step produces the same K_new/V_new.
+    # Build extended K/V cache with all total_steps decode tokens — PER BATCH.
+    # Since X is constant across steps, every decode step produces the same K_new/V_new per batch.
     # Decode token at step s lands at global index prefill_len + s.
     seq_len = prefill_len + total_steps
-    K_ext = np.zeros((kv_dim, seq_len), dtype=np.float32)
-    K_ext[:, :prefill_len] = XKCache[:, :prefill_len].astype(np.float32)
+    K_ext = np.zeros((bsz, kv_dim, seq_len), dtype=np.float32)
+    K_ext[:, :, :prefill_len] = XKCache[:, :, :prefill_len].astype(np.float32)
     for s in range(total_steps):
-        K_ext[:, prefill_len + s] = K_new[0, :].astype(np.float32)
+        for b in range(bsz):
+            K_ext[b, :, prefill_len + s] = K_new[b, :].astype(np.float32)
 
-    V_ext = np.zeros((seq_len, kv_dim), dtype=np.float32)
-    V_ext[:prefill_len, :] = XVCache[:prefill_len, :].astype(np.float32)
+    V_ext = np.zeros((bsz, seq_len, kv_dim), dtype=np.float32)
+    V_ext[:, :prefill_len, :] = XVCache[:, :prefill_len, :].astype(np.float32)
     for s in range(total_steps):
-        V_ext[prefill_len + s, :] = V_new[0, :].astype(np.float32)
+        for b in range(bsz):
+            V_ext[b, prefill_len + s, :] = V_new[b, :].astype(np.float32)
 
-    # Step 4+5: Attention per Q-head over seq_len tokens (same logic as Phase 2)
+    # Step 4+5: Attention per Q-head over seq_len tokens — per batch
     score_per_head = np.zeros((n_heads, bsz, seq_len), dtype=np.float32)
     for h in range(n_heads):
         kv_head = h // gqa_group_size
@@ -121,25 +123,26 @@ def compute_reference(X, W_norm, W_Q_perm, W_K, W_V, freqs_cos, freqs_sin,
             px = kv_head * pes_p_kv_head + s
             col_start = px * dim_p_pe + g * kv_dim_p_pe
             Q_h[:, s * kv_dim_p_pe:(s + 1) * kv_dim_p_pe] = Q_perm[:, col_start:col_start + kv_dim_p_pe].astype(np.float32)
-        K_kv = K_ext[kv_head * head_dim:(kv_head + 1) * head_dim, :]  # [head_dim, seq_len]
-        score_per_head[h] = Q_h @ K_kv
+        for b in range(bsz):
+            K_kv_b = K_ext[b, kv_head * head_dim:(kv_head + 1) * head_dim, :]  # [head_dim, seq_len]
+            score_per_head[h, b, :] = Q_h[b:b+1, :] @ K_kv_b
 
     score_scaled = (score_per_head * float(alpha)).astype(np.float16)
     attn_per_head = np.stack([softmax_csl(score_scaled[h]) for h in range(n_heads)])  # [n_heads, bsz, seq_len]
 
     # Step 6: Output per head — BATCH-OUTER layout [bsz, gqa_group_size, kv_dim_p_pe]
-    # output[b * dim_p_pe + g * kv_dim_p_pe : ... + kv_dim_p_pe] = attn[h,b] @ V
+    # output[b * dim_p_pe + g * kv_dim_p_pe : ... + kv_dim_p_pe] = attn[h,b] @ V[b]
     output_grid = np.zeros((P, P, bsz * dim_p_pe), dtype=np.float32)
     for px in range(P):
         kv_head = px // pes_p_kv_head
-        v_slice = V_ext[:, px * kv_dim_p_pe:(px + 1) * kv_dim_p_pe]  # [seq_len, kv_dim_p_pe]
         for g in range(gqa_group_size):
             h = kv_head * gqa_group_size + g
-            out_g = (attn_per_head[h].astype(np.float32) @ v_slice.astype(np.float32)).astype(np.float16)  # [bsz, kv_dim_p_pe]
             for b in range(bsz):
+                v_slice_b = V_ext[b, :, px * kv_dim_p_pe:(px + 1) * kv_dim_p_pe]  # [seq_len, kv_dim_p_pe]
+                out_g = (attn_per_head[h, b:b+1, :].astype(np.float32) @ v_slice_b.astype(np.float32)).astype(np.float16)  # [1, kv_dim_p_pe]
                 start = b * dim_p_pe + g * kv_dim_p_pe
                 for py in range(P):
-                    output_grid[py, px, start:start + kv_dim_p_pe] = out_g[b, :]
+                    output_grid[py, px, start:start + kv_dim_p_pe] = out_g[0, :]
 
     return {
         'X_norm':           X_norm,
@@ -268,41 +271,47 @@ def d2h(runner, sym_id, P, bsz, data_per_pe, io_dtype, memcpy_order):
 # Phase 3 interleaved KV cache tiling
 # ─────────────────────────────────────────────────────────────────────────────
 
-def tile_kcache_interleaved(K_cache, P, kv_dim_p_pe, max_seq_len_p_pe, prefill_len_p_pe):
+def tile_kcache_interleaved(K_cache, P, bsz, kv_dim_p_pe, max_seq_len_p_pe, prefill_len_p_pe):
     """
-    Build KCache_tile[P, P, kv_dim_p_pe * max_seq_len_p_pe] for H2D ROW_MAJOR.
-    PE(px, py) gets K rows px*kv_dim_p_pe..(px+1)*kv_dim_p_pe for
-    tokens {py, py+P, ..., py+(prefill_len_p_pe-1)*P} in slots 0..prefill_len_p_pe-1.
-    Slots prefill_len_p_pe..max_seq_len_p_pe-1 are zeros.
-    K_cache: [kv_dim, max_seq_len], interleaved so K_cache[:, t] = K for global token t.
-    Layout: tile[py, px, k*max_seq_len_p_pe + s] = K_cache[px*kv_dim_p_pe+k, py+s*P].
+    Build KCache_tile[P, P, bsz * kv_dim_p_pe * max_seq_len_p_pe] for H2D ROW_MAJOR.
+    K_cache: [bsz, kv_dim, max_seq_len], interleaved so K_cache[b, :, t] = K for batch b, global token t.
+    On-chip layout per PE: [bsz, kv_dim_p_pe, max_seq_len_p_pe] — bsz slowest.
+    tile[py, px, b*kv_dim_p_pe*max_seq_len_p_pe + k*max_seq_len_p_pe + s]
+        = K_cache[b, px*kv_dim_p_pe+k, py+s*P].
     """
-    tile = np.zeros((P, P, kv_dim_p_pe * max_seq_len_p_pe), dtype=np.float16)
-    for py in range(P):
-        for px in range(P):
-            for s in range(prefill_len_p_pe):
-                token = py + s * P
-                k_row_start = px * kv_dim_p_pe
-                k_row_end = (px + 1) * kv_dim_p_pe
-                tile[py, px, s::max_seq_len_p_pe] = K_cache[k_row_start:k_row_end, token]
+    cache_per_pe = kv_dim_p_pe * max_seq_len_p_pe
+    tile = np.zeros((P, P, bsz * cache_per_pe), dtype=np.float16)
+    for b in range(bsz):
+        for py in range(P):
+            for px in range(P):
+                for s in range(prefill_len_p_pe):
+                    token = py + s * P
+                    k_row_start = px * kv_dim_p_pe
+                    k_row_end = (px + 1) * kv_dim_p_pe
+                    for k in range(kv_dim_p_pe):
+                        tile[py, px, b * cache_per_pe + k * max_seq_len_p_pe + s] = \
+                            K_cache[b, k_row_start + k, token]
     return tile
 
-def tile_vcache_interleaved(V_cache, P, kv_dim_p_pe, max_seq_len_p_pe, prefill_len_p_pe):
+def tile_vcache_interleaved(V_cache, P, bsz, kv_dim_p_pe, max_seq_len_p_pe, prefill_len_p_pe):
     """
-    Build VCache_tile[P, P, max_seq_len_p_pe * kv_dim_p_pe] for H2D ROW_MAJOR.
-    PE(px, py) gets V for tokens {py, py+P, ..., py+(prefill_len_p_pe-1)*P} in rows 0..prefill_len_p_pe-1.
-    Rows prefill_len_p_pe..max_seq_len_p_pe-1 are zeros.
-    V_cache: [max_seq_len, kv_dim], interleaved so V_cache[t, :] = V for global token t.
-    Layout: tile[py, px, s*kv_dim_p_pe + j] = V_cache[py+s*P, px*kv_dim_p_pe+j].
+    Build VCache_tile[P, P, bsz * max_seq_len_p_pe * kv_dim_p_pe] for H2D ROW_MAJOR.
+    V_cache: [bsz, max_seq_len, kv_dim], interleaved so V_cache[b, t, :] = V for batch b, global token t.
+    On-chip layout per PE: [bsz, max_seq_len_p_pe, kv_dim_p_pe] — bsz slowest.
+    tile[py, px, b*max_seq_len_p_pe*kv_dim_p_pe + s*kv_dim_p_pe + j]
+        = V_cache[b, py+s*P, px*kv_dim_p_pe+j].
     """
-    tile = np.zeros((P, P, max_seq_len_p_pe * kv_dim_p_pe), dtype=np.float16)
-    for py in range(P):
-        for px in range(P):
-            j_start = px * kv_dim_p_pe
-            j_end = (px + 1) * kv_dim_p_pe
-            for s in range(prefill_len_p_pe):
-                token = py + s * P
-                tile[py, px, s * kv_dim_p_pe:(s + 1) * kv_dim_p_pe] = V_cache[token, j_start:j_end]
+    cache_per_pe = max_seq_len_p_pe * kv_dim_p_pe
+    tile = np.zeros((P, P, bsz * cache_per_pe), dtype=np.float16)
+    for b in range(bsz):
+        for py in range(P):
+            for px in range(P):
+                j_start = px * kv_dim_p_pe
+                j_end = (px + 1) * kv_dim_p_pe
+                for s in range(prefill_len_p_pe):
+                    token = py + s * P
+                    tile[py, px, b * cache_per_pe + s * kv_dim_p_pe:(b * cache_per_pe + (s + 1) * kv_dim_p_pe)] = \
+                        V_cache[b, token, j_start:j_end]
     return tile
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -450,17 +459,17 @@ def main():
         freqs_sin_ref[off: off + _dim_p_pe // 2] = pe_freqs_sin[_px, :]
 
     # ─── Phase 3 KV cache: max_seq_len capacity, only prefill_len positions filled ─
-    # Interleaved layout: tensor_XKCache[:, t] = K for global token t
-    #   (so PE py=t%P, slot t//P sees it).
+    # Batched: tensor_XKCache[bsz, kv_dim, max_seq_len], tensor_XVCache[bsz, max_seq_len, kv_dim].
+    # Interleaved layout: tensor_XKCache[b, :, t] = K for batch b, global token t.
     # Only tokens 0..prefill_len-1 are pre-loaded; rest are zeros.
-    tensor_XKCache = np.zeros((kv_dim, max_seq_len), dtype=np.float16)
-    tensor_XVCache = np.zeros((max_seq_len, kv_dim), dtype=np.float16)
+    tensor_XKCache = np.zeros((bsz, kv_dim, max_seq_len), dtype=np.float16)
+    tensor_XVCache = np.zeros((bsz, max_seq_len, kv_dim), dtype=np.float16)
     if args.simple:
-        tensor_XKCache[:, :prefill_len] = np.full((kv_dim, prefill_len), 0.04, dtype=np.float16)
-        tensor_XVCache[:prefill_len, :] = np.full((prefill_len, kv_dim), 0.05, dtype=np.float16)
+        tensor_XKCache[:, :, :prefill_len] = np.full((bsz, kv_dim, prefill_len), 0.04, dtype=np.float16)
+        tensor_XVCache[:, :prefill_len, :] = np.full((bsz, prefill_len, kv_dim), 0.05, dtype=np.float16)
     else:
-        tensor_XKCache[:, :prefill_len] = np.random.rand(kv_dim, prefill_len).astype(np.float16)
-        tensor_XVCache[:prefill_len, :] = np.random.rand(prefill_len, kv_dim).astype(np.float16)
+        tensor_XKCache[:, :, :prefill_len] = np.random.rand(bsz, kv_dim, prefill_len).astype(np.float16)
+        tensor_XVCache[:, :prefill_len, :] = np.random.rand(bsz, prefill_len, kv_dim).astype(np.float16)
 
     tensor_o_weight    = mk(dim, dim)
     tensor_up_weight   = mk(dim, ffn_dim)
@@ -499,10 +508,11 @@ def main():
     GT_tile = tile_weight_row(tensor_gate_weight, dim_p_pe, ffn_dim_p_pe)
     DN_tile = tile_weight_row(tensor_down_weight, ffn_dim_p_pe, dim_p_pe)
 
-    # Phase 3 interleaved KV cache tiling:
-    # PE(px, py) gets K/V for tokens {py, py+P, ..., py+(prefill_len_p_pe-1)*P}.
-    KCache_tile = tile_kcache_interleaved(tensor_XKCache, P, kv_dim_p_pe, max_seq_len_p_pe, prefill_len_p_pe)
-    VCache_tile = tile_vcache_interleaved(tensor_XVCache, P, kv_dim_p_pe, max_seq_len_p_pe, prefill_len_p_pe)
+    # Phase 3 interleaved KV cache tiling (batched):
+    # PE(px, py) gets K/V for tokens {py, py+P, ..., py+(prefill_len_p_pe-1)*P}, per batch.
+    # On-chip layout: [bsz, kv_dim_p_pe, max_seq_len_p_pe] and [bsz, max_seq_len_p_pe, kv_dim_p_pe].
+    KCache_tile = tile_kcache_interleaved(tensor_XKCache, P, bsz, kv_dim_p_pe, max_seq_len_p_pe, prefill_len_p_pe)
+    VCache_tile = tile_vcache_interleaved(tensor_XVCache, P, bsz, kv_dim_p_pe, max_seq_len_p_pe, prefill_len_p_pe)
 
     # ─── Runner ───────────────────────────────────────────────────────────────
     if args.cmaddr:
@@ -556,8 +566,8 @@ def main():
     h2d(sym_V_weight,    V_tile,        dim_p_pe * kv_dim_p_pe)
     h2d(sym_freqs_sin,   tensor_freqs_sin, _dim_p_pe // 2)
     h2d(sym_freqs_cos,   tensor_freqs_cos, _dim_p_pe // 2)
-    h2d(sym_XKCache,     KCache_tile,   kv_dim_p_pe * max_seq_len_p_pe)
-    h2d(sym_XVCache,     VCache_tile,   max_seq_len_p_pe * kv_dim_p_pe)
+    h2d(sym_XKCache,     KCache_tile,   bsz * kv_dim_p_pe * max_seq_len_p_pe)
+    h2d(sym_XVCache,     VCache_tile,   bsz * max_seq_len_p_pe * kv_dim_p_pe)
     h2d(sym_O_weight,    O_tile,        dim_p_pe * dim_p_pe)
     h2d(sym_UP_weight,   UP_tile,       dim_p_pe * ffn_dim_p_pe)
     h2d(sym_GATE_weight, GT_tile,       dim_p_pe * ffn_dim_p_pe)
@@ -710,19 +720,19 @@ def main():
     for py in range(P):
         iters = iter_num_per_pe[py]
         for px in range(P):
-            K_pe = np.zeros((kv_dim_p_pe, iters), dtype=np.float32)
-            for s in range(min(iters, prefill_len_p_pe)):
-                token = py + s * P
-                K_pe[:, s] = tensor_XKCache[px * kv_dim_p_pe:(px + 1) * kv_dim_p_pe, token].astype(np.float32)
-            # Decode slots: all have same K_new since X is constant across steps
-            for j in range(prefill_len_p_pe, iters):
-                K_pe[:, j] = ref['K_new'][0, px * kv_dim_p_pe:(px + 1) * kv_dim_p_pe].astype(np.float32)
-            for g in range(gqa_group_size):
-                q_g = Q_perm_full[:, px * dim_p_pe + g * kv_dim_p_pe : px * dim_p_pe + (g + 1) * kv_dim_p_pe].astype(np.float32)
-                partial = (q_g @ K_pe).astype(np.float16)  # [bsz, iters]
-                for b in range(bsz):
+            for b in range(bsz):
+                K_pe = np.zeros((kv_dim_p_pe, iters), dtype=np.float32)
+                for s in range(min(iters, prefill_len_p_pe)):
+                    token = py + s * P
+                    K_pe[:, s] = tensor_XKCache[b, px * kv_dim_p_pe:(px + 1) * kv_dim_p_pe, token].astype(np.float32)
+                # Decode slots: all have same K_new since X is constant across steps
+                for j in range(prefill_len_p_pe, iters):
+                    K_pe[:, j] = ref['K_new'][b, px * kv_dim_p_pe:(px + 1) * kv_dim_p_pe].astype(np.float32)
+                for g in range(gqa_group_size):
+                    q_g = Q_perm_full[b:b+1, px * dim_p_pe + g * kv_dim_p_pe : px * dim_p_pe + (g + 1) * kv_dim_p_pe].astype(np.float32)
+                    partial = (q_g @ K_pe).astype(np.float16)  # [1, iters]
                     base = b * gqa_group_size * iters + g * iters  # batch-outer layout
-                    score_5a_ref[py, px, base : base + iters] = partial[b, :]
+                    score_5a_ref[py, px, base : base + iters] = partial[0, :]
 
     # score_5b_ref: after KV-head-scoped X-reduce + alpha scale (all groups, batch-outer)
     score_5b_ref = np.zeros((P, P, bsz * gqa_group_size * max_seq_len_p_pe), dtype=np.float16)
@@ -838,7 +848,7 @@ def main():
     if args.simple:
         alpha_f = 1.0 / np.sqrt(float(head_dim))
         q_val = float(ref['Q_perm'][0, 0])
-        k_val = float(tensor_XKCache[0, 0])
+        k_val = float(tensor_XKCache[0, 0, 0])
         print(f"\n  Hand-check (g=0): seq_len_ref={seq_len_ref}  alpha={alpha_f:.4f}")
 
     # ── Step 6: output_matvec_mult ───────────────────────────────────────────

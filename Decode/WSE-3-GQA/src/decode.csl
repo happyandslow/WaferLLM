@@ -272,8 +272,12 @@ fn range_copy_2d_strided(dest: *f16, src: *f16, size: u16, stride_dest_outer: i1
 
 // Write new K and V tokens to on-chip cache at position iter_num.
 // Called only by the owning PE (py == step % P). Increments iter_num.
-// K layout: [bsz, kv_dim_p_pe, max_seq_len_p_pe] — write column iter_num via stride max_seq_len_p_pe.
-// V layout: [bsz, max_seq_len_p_pe, kv_dim_p_pe] — write row iter_num contiguously.
+// K cache layout: [bsz, kv_dim_p_pe, max_seq_len_p_pe] — bsz slowest.
+//   Per batch: write column iter_num via stride max_seq_len_p_pe.
+//   range_copy_2d_strided iterates over bsz with stride kv_dim_p_pe*max_seq_len_p_pe.
+// V cache layout: [bsz, max_seq_len_p_pe, kv_dim_p_pe] — bsz slowest.
+//   Per batch: write row iter_num contiguously.
+//   range_copy_2d_strided iterates over bsz with stride max_seq_len_p_pe*kv_dim_p_pe.
 fn process_kv() void {
     var remain: i16 = step % P;
     if (py == remain) {
@@ -361,13 +365,15 @@ var freqs_cos: [_dim_p_pe / 2]f16 = @zeros([_dim_p_pe / 2]f16);
 var ptr_freqs_cos: [*]f16 = &freqs_cos;
 var freqs_cos_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &freqs_cos, .extent = _dim_p_pe / 2 });
 
-var XKCache_tile: [kv_dim_p_pe * max_seq_len_p_pe]f16 = @zeros([kv_dim_p_pe * max_seq_len_p_pe]f16);
+// KV cache: [bsz, kv_dim_p_pe, max_seq_len_p_pe] and [bsz, max_seq_len_p_pe, kv_dim_p_pe]
+// bsz is the slowest (outermost) dimension — each batch element has its own cache.
+var XKCache_tile: [bsz * kv_dim_p_pe * max_seq_len_p_pe]f16 = @zeros([bsz * kv_dim_p_pe * max_seq_len_p_pe]f16);
 var ptr_XKCache: [*]f16 = &XKCache_tile;
-var XKCache_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &XKCache_tile, .extent = kv_dim_p_pe * max_seq_len_p_pe });
+var XKCache_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &XKCache_tile, .extent = bsz * kv_dim_p_pe * max_seq_len_p_pe });
 
-var XVCache_tile: [max_seq_len_p_pe * kv_dim_p_pe]f16 = @zeros([max_seq_len_p_pe * kv_dim_p_pe]f16);
+var XVCache_tile: [bsz * max_seq_len_p_pe * kv_dim_p_pe]f16 = @zeros([bsz * max_seq_len_p_pe * kv_dim_p_pe]f16);
 var ptr_XVCache: [*]f16 = &XVCache_tile;
-var XVCache_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &XVCache_tile, .extent = max_seq_len_p_pe * kv_dim_p_pe });
+var XVCache_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &XVCache_tile, .extent = bsz * max_seq_len_p_pe * kv_dim_p_pe });
 
 var O_weight_tile: [dim_p_pe * dim_p_pe]f16 = @zeros([dim_p_pe * dim_p_pe]f16);
 var ptr_O_weight: [*]f16 = &O_weight_tile;
@@ -706,23 +712,15 @@ fn score_matvec_mult() void {
     //   Since dim_p_pe = gqa_group_size * kv_dim_p_pe, this is contiguous:
     //   just bsz * gqa_group_size sub-blocks of kv_dim_p_pe each = bsz * dim_p_pe total.
     //
-    // K^T CACHE (UNBATCHED): XKCache_tile[kv_dim_p_pe × max_seq_len_p_pe]
-    //   Shared across ALL batches and ALL GQA groups.
-    //   Only first iter_num columns of each row are valid.
+    // K^T CACHE (BATCHED): XKCache_tile[bsz, kv_dim_p_pe, max_seq_len_p_pe]
+    //   Each batch has its own K cache section. All GQA groups within a batch share
+    //   the same K cache. Only first iter_num columns of each row are valid.
     //
-    // KEY INSIGHT (from original vecmat_computation, line 232):
-    //   The original resets K each batch: right_matrix_dsd = @set_dsd_base_addr(... ptr_right_matrix)
-    //   With unbatched K shared across (b,g), we MUST reset K every iteration.
-    //   GQA simply repeats the bsz loop gqa_group_size times with the same K matrix.
-    //   With batch-outer layout for both Q and score, sub-blocks are contiguous,
-    //   so flat sequential iteration over bsz * gqa_group_size pairs works naturally.
-    //
-    // GEMV structure: bsz * gqa_group_size iterations (one per (b,g) pair).
-    //   Each iteration:
-    //     1. Reset K to cache base (unbatched → must re-read for every pair)
-    //     2. Inner loop: kv_dim_p_pe scalar-broadcast multiply-accumulate steps
-    //        score[j] += Q[i] * K[i * max_seq_len_p_pe + j]  for j in 0..iter_num-1
-    //     3. Advance Q by 1 (element-wise in inner loop), score by iter_num (next slot)
+    // GEMV structure: nested bsz × gqa_group_size loop.
+    //   Per batch: reset K to batch's cache base.
+    //   Per group within batch: reset K to same batch base (via decrement after inner).
+    //   Inner loop: kv_dim_p_pe scalar-broadcast multiply-accumulate steps
+    //     score[j] += Q[i] * K[i * max_seq_len_p_pe + j]  for j in 0..iter_num-1
 
     left_vector_dsd = @set_dsd_length(left_vector_dsd, 1);
     right_matrix_dsd = @set_dsd_length(right_matrix_dsd, @bitcast(u16, Nt));
@@ -730,26 +728,34 @@ fn score_matvec_mult() void {
 
     left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, &QKV_tile);
     out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_score);
+    right_matrix_dsd = @set_dsd_base_addr(right_matrix_dsd, ptr_right_matrix);
 
-    for (@range(i16, bsz * gqa_group_size)) |_| {
-        // RESET K to cache base — CRITICAL: K is unbatched, same for every (b,g).
-        right_matrix_dsd = @set_dsd_base_addr(right_matrix_dsd, ptr_right_matrix);
+    // BATCHED K CACHE: [bsz, kv_dim_p_pe, max_seq_len_p_pe]
+    // Each batch has its own K cache section, stride = kv_dim_p_pe * max_seq_len_p_pe.
+    // Within each batch, all gqa_group_size groups share the same K cache.
+    // right_matrix_dsd tracks the current batch's K cache base.
+    for (@range(i16, bsz)) |_| {
+        for (@range(i16, gqa_group_size)) |_| {
+            // right_matrix_dsd points to this batch's K cache base.
+            @load_to_dsr(dest_dsr_1, out_vector_dsd, .{ .save_address = false });
+            @load_to_dsr(src0_dsr_1, out_vector_dsd, .{ .save_address = false });
 
-        @load_to_dsr(dest_dsr_1, out_vector_dsd, .{ .save_address = false });
-        @load_to_dsr(src0_dsr_1, out_vector_dsd, .{ .save_address = false });
+            // Inner loop: kv_dim_p_pe scalar-broadcast multiply-accumulate steps.
+            // Each step: score[:] += Q[i] * K_row_i[:iter_num]
+            for (@range(i16, Kt)) |_| {
+                @load_to_dsr(src1_dsr_1, right_matrix_dsd, .{ .save_address = false });
+                @map(gemv_static_step, left_vector_dsd);
+                left_vector_dsd = @increment_dsd_offset(left_vector_dsd, 1, f16);
+                right_matrix_dsd = @increment_dsd_offset(right_matrix_dsd, max_seq_len_p_pe, f16);
+            }
+            // After inner loop: right_matrix_dsd advanced by Kt * max_seq_len_p_pe
+            // = kv_dim_p_pe * max_seq_len_p_pe. Reset to this batch's base for next group.
+            right_matrix_dsd = @increment_dsd_offset(right_matrix_dsd, -kv_dim_p_pe * max_seq_len_p_pe, f16);
 
-        // Inner loop: kv_dim_p_pe scalar-broadcast multiply-accumulate steps.
-        // Each step: score[:] += Q[i] * K_row_i[:iter_num]
-        // dest/src0 have save_address=false → reset to score base after each @map,
-        // so all Kt steps accumulate into the same output vector.
-        for (@range(i16, Kt)) |_| {
-            @load_to_dsr(src1_dsr_1, right_matrix_dsd, .{ .save_address = false });
-            @map(gemv_static_step, left_vector_dsd);
-            left_vector_dsd = @increment_dsd_offset(left_vector_dsd, 1, f16);
-            right_matrix_dsd = @increment_dsd_offset(right_matrix_dsd, max_seq_len_p_pe, f16);
+            out_vector_dsd = @increment_dsd_offset(out_vector_dsd, Nt, f16);
         }
-
-        out_vector_dsd = @increment_dsd_offset(out_vector_dsd, Nt, f16);
+        // Advance to next batch's K cache section.
+        right_matrix_dsd = @increment_dsd_offset(right_matrix_dsd, kv_dim_p_pe * max_seq_len_p_pe, f16);
     }
 
     // Snapshot 5a: copy full score buffer
@@ -868,16 +874,14 @@ fn output_matvec_mult_all_groups() void {
     // Score layout (batch-outer): [b0_g0(iter_num), b0_g1(iter_num), ...]
     //   = bsz * gqa_group_size packed sub-blocks of iter_num each.
     //
-    // V CACHE (UNBATCHED): XVCache_tile[max_seq_len_p_pe × kv_dim_p_pe]
-    //   Shared across all batches and groups — must RESET V each iteration.
-    //   (Same pattern as K reset in score_matvec_mult.)
+    // V CACHE (BATCHED): XVCache_tile[bsz, max_seq_len_p_pe, kv_dim_p_pe]
+    //   Each batch has its own V cache section, stride = max_seq_len_p_pe * kv_dim_p_pe.
+    //   Within each batch, all gqa_group_size groups share the same V.
+    //   right_matrix_dsd is NOT modified by @load_to_dsr (only DSR advances),
+    //   so it naturally stays at this batch's V base for all groups.
     //
     // Output layout: [out_b0_g0(kv_dim_p_pe), out_b0_g1(kv_dim_p_pe), ...]
     //   = batch-outer, group-inner (matches Q layout for subsequent O-projection).
-    //
-    // Each (b,g) pair: output[b,g,:kv_dim_p_pe] = score[b,g,:iter_num] @ V[:iter_num, :kv_dim_p_pe]
-    // Using the original vecmat_computation pattern: reset V, use save_address=true
-    // for auto-advancing through V rows during the GEMV.
 
     left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_score);
     out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_output);
@@ -888,19 +892,24 @@ fn output_matvec_mult_all_groups() void {
     left_vector_dsd = @set_dsd_length(left_vector_dsd, @bitcast(u16, Kt));
     right_matrix_dsd = @set_dsd_length(right_matrix_dsd, @bitcast(u16, Nt));
     out_vector_dsd = @set_dsd_length(out_vector_dsd, @bitcast(u16, Nt));
+    right_matrix_dsd = @set_dsd_base_addr(right_matrix_dsd, ptr_right_matrix);
 
-    for (@range(i16, bsz * gqa_group_size)) |_| {
-        // RESET V to cache base — V is unbatched, same for every (b,g).
-        right_matrix_dsd = @set_dsd_base_addr(right_matrix_dsd, ptr_right_matrix);
+    for (@range(i16, bsz)) |_| {
+        for (@range(i16, gqa_group_size)) |_| {
+            // right_matrix_dsd points to this batch's V base.
+            // @load_to_dsr does NOT modify right_matrix_dsd (only DSR advances via save_address),
+            // so all groups within the same batch re-read the same V cache.
+            @load_to_dsr(dest_dsr_1, out_vector_dsd, .{ .save_address = false });
+            @load_to_dsr(src0_dsr_1, out_vector_dsd, .{ .save_address = false });
+            @load_to_dsr(src1_dsr_1, right_matrix_dsd, .{ .save_address = true });
 
-        @load_to_dsr(dest_dsr_1, out_vector_dsd, .{ .save_address = false });
-        @load_to_dsr(src0_dsr_1, out_vector_dsd, .{ .save_address = false });
-        @load_to_dsr(src1_dsr_1, right_matrix_dsd, .{ .save_address = true });
+            @map(gemv_static_step, left_vector_dsd);
 
-        @map(gemv_static_step, left_vector_dsd);
-
-        left_vector_dsd = @increment_dsd_offset(left_vector_dsd, Kt, f16);
-        out_vector_dsd = @increment_dsd_offset(out_vector_dsd, Nt, f16);
+            left_vector_dsd = @increment_dsd_offset(left_vector_dsd, Kt, f16);
+            out_vector_dsd = @increment_dsd_offset(out_vector_dsd, Nt, f16);
+        }
+        // Advance to next batch's V cache section.
+        right_matrix_dsd = @increment_dsd_offset(right_matrix_dsd, max_seq_len_p_pe * kv_dim_p_pe, f16);
     }
 
     // Single Y-reduce covers all gqa_group_size sub-head outputs (full output_tile)
