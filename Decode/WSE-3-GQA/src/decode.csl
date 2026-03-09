@@ -760,8 +760,6 @@ fn score_matvec_mult() void {
 
     // Snapshot 5a: copy full score buffer
     for (@range(i16, gqa_group_size * bsz * max_seq_len_p_pe)) |i| { score_post_gemv[i] = score[i]; }
-    simprint.print_string(" score_dsd pre reduce: ");
-    simprint_pe_coords_dsd(score_post_gemv_dsd);
 
     // Phase 2: ONE batched variable-length KV-head-scoped X-reduce over all groups
     comm_mod.all_reduce_bsz_g_var_seq_len_kv_head_scoped(px_in_kv_head, quotient_x_in_kv_head, remainder_x, ptr_score, iter_num);
@@ -824,8 +822,6 @@ fn softmax_score_all_groups() void {
     @map(fsubh_func, local_max_g_dsd);
 
     @map(fast_exp, score_tmp_dsd, score_dsd);
-    simprint.print_string(" score_dsd post exp: ");
-    simprint_pe_coords_dsd(score_dsd);
 
     score_dsd = @set_dsd_length(score_dsd, @bitcast(u16, bsz * max_seq_len_p_pe * gqa_group_size));
     score_dsd = @set_dsd_base_addr(score_dsd, ptr_score);
