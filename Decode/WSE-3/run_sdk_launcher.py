@@ -2,12 +2,12 @@
 """
 SdkLauncher script for Decode WSE-3 module.
 
-Dispatches a pre-compiled artifact to the appliance via SdkLauncher,
-stages the host execution script (launch_sim.py) and config file,
-then runs the host code on the appliance.
+Dispatches a cslc-compiled artifact to the appliance via SdkLauncher
+using a staging directory containing the compiled output, host script,
+and config file.
 
 Prerequisites:
-    python compile.py <args>   # produces compile_out/artifact_{P}_{group_num}.json
+    python compile.py <config.json> [simulator]   # produces out/ directory
 
 Usage:
     python run_sdk_launcher.py --config model_config/test.json
@@ -16,6 +16,7 @@ Usage:
 import argparse
 import json
 import os
+import shutil
 import sys
 
 from cerebras.sdk.client import SdkLauncher
@@ -42,30 +43,29 @@ def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     os.chdir(script_dir)
 
-    # Read config to determine artifact path
     if not os.path.exists(args.config):
         print(f"Error: config file not found: {args.config}", file=sys.stderr)
         sys.exit(1)
 
-    with open(args.config, "r", encoding="utf8") as f:
-        config = json.load(f)
-
-    P = config["P"]
-    group_num = config["group_num"]
-
-    artifact_json_path = f"compile_out/artifact_{P}_{group_num}.json"
-    if not os.path.exists(artifact_json_path):
+    if not os.path.isdir("out"):
         print(
-            f"Error: artifact JSON not found: {artifact_json_path}\n"
-            f"Run compile.py first.",
+            "Error: compiled output directory 'out/' not found.\n"
+            "Run compile.py first.",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    with open(artifact_json_path, "r", encoding="utf8") as f:
-        artifact_id = json.load(f)["artifact_id"]
-
     config_basename = os.path.basename(args.config)
+
+    # Build staging directory with compiled output + host scripts
+    staging_dir = "launcher_staging"
+    if os.path.exists(staging_dir):
+        shutil.rmtree(staging_dir)
+    os.makedirs(staging_dir)
+
+    shutil.copytree("out", os.path.join(staging_dir, "out"))
+    shutil.copy2("launch_sim.py", staging_dir)
+    shutil.copy2(args.config, staging_dir)
 
     run_cmd = (
         f"cs_python launch_sim.py --config {config_basename} "
@@ -74,21 +74,21 @@ def main():
 
     print(f"=== Decode WSE-3: SdkLauncher Dispatch ===")
     print(f"Config       : {args.config}")
-    print(f"Artifact     : {artifact_id}")
+    print(f"Staging dir  : {staging_dir}")
     print(f"Simulator    : {args.simulator}")
     print(f"Run command  : {run_cmd}")
     print()
 
-    with SdkLauncher(artifact_id, simulator=args.simulator,
+    with SdkLauncher(staging_dir, simulator=args.simulator,
                      disable_version_check=True) as launcher:
-        launcher.stage("launch_sim.py")
-        launcher.stage(args.config)
-
-        print(f"Executing on appliance...")
+        print("Executing on appliance...")
         response = launcher.run(run_cmd)
 
     print("Appliance response:")
     print(response)
+
+    # Clean up staging directory
+    shutil.rmtree(staging_dir, ignore_errors=True)
 
     return response
 
