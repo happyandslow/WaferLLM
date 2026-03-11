@@ -1,6 +1,6 @@
 {
     "P": 540,
-    "group_num": 20,
+    "group_num": 32,
     "bsz": 1,
     "dim": 4320,
     "n_heads": 32,
