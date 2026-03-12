@@ -127,6 +127,7 @@ def main():
     # timer symbol list:
     symbol_timer_buf = runner.get_id("timer_buf")
     symbol_timer_ref = runner.get_id("time_ref")
+    sym_prof_timer = runner.get_id("prof_timer_buf")
     sym_debug = runner.get_id("debug")
     
     
@@ -259,7 +260,17 @@ def main():
         data_type=MemcpyDataType.MEMCPY_32BIT, order=MemcpyOrder.ROW_MAJOR, nonblock=False
     )
     timer_buf_time_hwl = timer_buf_1d_u32.view(np.float32).reshape((P, P, 3))
-    
+
+    # D2H: per-function profiling timer
+    NUM_PROF_FNS = 3  # score_matvec_mult, softmax_score, output_matvec_mult
+    prof_buf_1d = np.zeros(P * P * NUM_PROF_FNS * 3, dtype=np.uint32)
+    runner.memcpy_d2h(
+        prof_buf_1d, sym_prof_timer, 0, 0, P, P, NUM_PROF_FNS * 3,
+        streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
+        order=MemcpyOrder.ROW_MAJOR, nonblock=False
+    )
+    prof_hwl = prof_buf_1d.view(np.float32).reshape((P, P, NUM_PROF_FNS * 3))
+
     runner.stop()
     
     # -------------------------------------------------------------------------- #
@@ -288,9 +299,38 @@ def main():
     for pe_x in range(P):
         for pe_y in range(P):
             cycles_count[pe_y, pe_x] = calculate_cycles(timer_buf_time_hwl[pe_y, pe_x, :])
-    
-    cycles_count_mean = cycles_count.mean()
-    print(f"Host: mean cycles count: {cycles_count_mean/repeat_steps}")
+    c = cycles_count.flatten() / repeat_steps
+    print(f"\n--- Cycle statistics across {P}x{P} PEs (per iteration) ---")
+    print(f"  mean   = {c.mean():.0f}")
+    print(f"  median = {np.median(c):.0f}")
+    print(f"  std    = {c.std():.0f}")
+    print(f"  min    = {c.min():.0f}")
+    print(f"  max    = {c.max():.0f}")
+    print(f"  p5     = {np.percentile(c, 5):.0f}")
+    print(f"  p25    = {np.percentile(c, 25):.0f}")
+    print(f"  p75    = {np.percentile(c, 75):.0f}")
+    print(f"  p95    = {np.percentile(c, 95):.0f}")
+    print(f"  p99    = {np.percentile(c, 99):.0f}")
+
+    # ─── Per-function profiling ───────────────────────────────────────────────
+    prof_fn_names = ["score_matvec_mult", "softmax_score", "output_matvec_mult"]
+    for fn_idx, fn_name in enumerate(prof_fn_names):
+        fn_cycles = np.zeros((P, P))
+        for pe_x in range(P):
+            for pe_y in range(P):
+                fn_cycles[pe_y, pe_x] = calculate_cycles(prof_hwl[pe_y, pe_x, fn_idx*3:(fn_idx+1)*3])
+        fc = fn_cycles.flatten()
+        print(f"\n--- {fn_name} cycle statistics across {P}x{P} PEs (last iteration) ---")
+        print(f"  mean   = {fc.mean():.0f}")
+        print(f"  median = {np.median(fc):.0f}")
+        print(f"  std    = {fc.std():.0f}")
+        print(f"  min    = {fc.min():.0f}")
+        print(f"  max    = {fc.max():.0f}")
+        print(f"  p5     = {np.percentile(fc, 5):.0f}")
+        print(f"  p25    = {np.percentile(fc, 25):.0f}")
+        print(f"  p75    = {np.percentile(fc, 75):.0f}")
+        print(f"  p95    = {np.percentile(fc, 95):.0f}")
+        print(f"  p99    = {np.percentile(fc, 99):.0f}")
 
 if __name__ == "__main__":
     main()

@@ -118,6 +118,17 @@ var tsc_ref_buf = @zeros([timestamp.tsc_size_words]u16);
 var time_ref_f32 = @zeros([2]f32);
 var ptr_time_ref: [*]f32 = &time_ref_f32;
 
+// Per-function profiling: 4 functions (process_kv, score_matvec_mult,
+// softmax_score_all_groups, output_matvec_mult_all_groups) → 5 boundary timestamps
+var prof_tsc_0 = @zeros([timestamp.tsc_size_words]u16);
+var prof_tsc_1 = @zeros([timestamp.tsc_size_words]u16);
+var prof_tsc_2 = @zeros([timestamp.tsc_size_words]u16);
+var prof_tsc_3 = @zeros([timestamp.tsc_size_words]u16);
+var prof_tsc_4 = @zeros([timestamp.tsc_size_words]u16);
+
+var prof_timer_buf = @zeros([12]f32); // 4 functions × 3 f32 each
+var ptr_prof_timer_buf: [*]f32 = &prof_timer_buf;
+
 // -------------------------------------------------------------------------- //
 // --------------------------------- Utils ---------------------------------- //
 // -------------------------------------------------------------------------- //
@@ -1067,16 +1078,21 @@ fn decode_struct() void {
     // xq_rope();  // TODO: RoPE disabled — strided-DSD @fmulh bug under investigation
     // xk_rope();
 
+    timestamp.get_timestamp(&prof_tsc_0);
     process_kv();  // write K,V to on-chip cache at iter_num (only py == step % P writes)
 
+    timestamp.get_timestamp(&prof_tsc_1);
     score_matvec_mult();  // gqa_group_size GEMVs + kv-head-scoped reduces inside
 
+    timestamp.get_timestamp(&prof_tsc_2);
     comm_mod.reconfig_allreduce_axis(1);
 
     @fmovh(output_dsd, 0.0);
     softmax_score_all_groups();       // 2 Y-reduces total (1 max + 1 sum), batched over all groups
 
+    timestamp.get_timestamp(&prof_tsc_3);
     output_matvec_mult_all_groups();  // G local GEMVs, no sync
+    timestamp.get_timestamp(&prof_tsc_4);
     
     comm_mod.reconfig_allreduce_axis(0);
 
@@ -1115,6 +1131,7 @@ fn exit() void {
 
     f_reference_timestamps();
     f_memcpy_timestamps();
+    f_pack_prof_timestamps();
     sys_mod.unblock_cmd_stream();
 }
 
@@ -1172,6 +1189,43 @@ fn f_memcpy_timestamps() void {
     timer_buf[2] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
 }
 
+fn f_pack_prof_timestamps() void {
+    var lo_p: u16 = 0;
+    var hi_p: u16 = 0;
+
+    // Function 0: process_kv (prof_tsc_0 → prof_tsc_1)
+    lo_p = prof_tsc_0[0]; hi_p = prof_tsc_0[1];
+    prof_timer_buf[0] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+    lo_p = prof_tsc_0[2]; hi_p = prof_tsc_1[0];
+    prof_timer_buf[1] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+    lo_p = prof_tsc_1[1]; hi_p = prof_tsc_1[2];
+    prof_timer_buf[2] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+
+    // Function 1: score_matvec_mult (prof_tsc_1 → prof_tsc_2)
+    lo_p = prof_tsc_1[0]; hi_p = prof_tsc_1[1];
+    prof_timer_buf[3] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+    lo_p = prof_tsc_1[2]; hi_p = prof_tsc_2[0];
+    prof_timer_buf[4] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+    lo_p = prof_tsc_2[1]; hi_p = prof_tsc_2[2];
+    prof_timer_buf[5] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+
+    // Function 2: softmax_score_all_groups (prof_tsc_2 → prof_tsc_3)
+    lo_p = prof_tsc_2[0]; hi_p = prof_tsc_2[1];
+    prof_timer_buf[6] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+    lo_p = prof_tsc_2[2]; hi_p = prof_tsc_3[0];
+    prof_timer_buf[7] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+    lo_p = prof_tsc_3[1]; hi_p = prof_tsc_3[2];
+    prof_timer_buf[8] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+
+    // Function 3: output_matvec_mult_all_groups (prof_tsc_3 → prof_tsc_4)
+    lo_p = prof_tsc_3[0]; hi_p = prof_tsc_3[1];
+    prof_timer_buf[9] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+    lo_p = prof_tsc_3[2]; hi_p = prof_tsc_4[0];
+    prof_timer_buf[10] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+    lo_p = prof_tsc_4[1]; hi_p = prof_tsc_4[2];
+    prof_timer_buf[11] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+}
+
 fn f_reference_timestamps() void {
     var lo_ : u16 = 0;
     var hi_ : u16 = 0;
@@ -1213,6 +1267,7 @@ comptime {
 comptime {
     @export_symbol(ptr_timer_buf, "timer_buf");
     @export_symbol(ptr_time_ref, "time_ref");
+    @export_symbol(ptr_prof_timer_buf, "prof_timer_buf");
     @export_symbol(ptr_debug, "debug");
 }
 
