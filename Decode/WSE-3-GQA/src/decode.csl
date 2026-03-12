@@ -479,7 +479,7 @@ var V_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &QKV_tile, .offset = bsz*(dim
 
 var score: [gqa_group_size * bsz * max_seq_len_p_pe]f16 = @zeros([gqa_group_size * bsz * max_seq_len_p_pe]f16);
 var ptr_score: [*]f16 = &score;
-var score_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &score, .extent = bsz * max_seq_len_p_pe });
+var score_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &score, .extent = bsz * max_seq_len_p_pe * gqa_group_size});
 
 var score_tmp: [bsz * max_seq_len_p_pe]f16 = @zeros([bsz * max_seq_len_p_pe]f16);
 var ptr_score_tmp: [*]f16 = &score_tmp;
@@ -491,6 +491,13 @@ var score_post_gemv_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &score_post_gem
 
 var score_post_reduce: [gqa_group_size * bsz * max_seq_len_p_pe]f16 = @zeros([gqa_group_size * bsz * max_seq_len_p_pe]f16);
 var ptr_score_post_reduce: [*]f16 = &score_post_reduce;
+
+// Test buffers: GEMV snapshots for comparison
+var score_v0_snapshot: [gqa_group_size * bsz * max_seq_len_p_pe]f16 = @zeros([gqa_group_size * bsz * max_seq_len_p_pe]f16);
+var ptr_score_v0_snapshot: [*]f16 = &score_v0_snapshot;
+
+var score_v2_snapshot: [gqa_group_size * bsz * max_seq_len_p_pe]f16 = @zeros([gqa_group_size * bsz * max_seq_len_p_pe]f16);
+var ptr_score_v2_snapshot: [*]f16 = &score_v2_snapshot;
 
 var output_tile: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
 var ptr_output: [*]f16 = &output_tile;
@@ -786,8 +793,296 @@ fn score_matvec_mult() void {
     score_dsd = @set_dsd_length(score_dsd, @bitcast(u16, bsz * iter_num * gqa_group_size));
 
     // Snapshot 5b: copy full score buffer
-    for (@range(i16, gqa_group_size * bsz * max_seq_len_p_pe)) |i| { score_post_reduce[i] = score[i]; }
+    // for (@range(i16, gqa_group_size * bsz * max_seq_len_p_pe)) |i| { score_post_reduce[i] = score[i]; }
 }
+
+// K-outer, group-inner variant of score_matvec_mult.
+// Iterates K rows in the outer loop and cycles through GQA groups in the
+// inner loop so that right_matrix_dsd (K cache) only advances forward —
+// it never traverses back. Each K row is loaded once and reused across
+// all G groups via save_address=false on the src1 DSR.
+fn score_matvec_mult_k_outer() void {
+    simprint.print_string("--- score_matvec_mult_k_outer_v1 --- ");
+    // Zero full max-capacity score buffer, then use iter_num-length GEMVs.
+    score_dsd = @set_dsd_length(score_dsd, @bitcast(u16, gqa_group_size * bsz * max_seq_len_p_pe));
+    score_dsd = @set_dsd_base_addr(score_dsd, ptr_score);
+    @fmovh(score_dsd, 0.0);
+    simprint.print_string("xq: ");
+    simprint_pe_coords_dsd(Q_dsd);
+    simprint.print_string(" kcache: ");
+    simprint_pe_coords_dsd(XKCache_dsd);
+
+    ptr_right_matrix = &XKCache_tile;
+    Kt = kv_dim_p_pe;
+    Nt = iter_num;
+
+    // ---- SCORE GEMV: Q[b,g] @ K^T → score[b,g] ----
+    //
+    // K-OUTER, GROUP-INNER approach:
+    //   For each K row k, cycle through all GQA groups:
+    //     score[b,g,:] += Q[b,g,k] * K[b,k,:]
+    //
+    // Q[b,g,k] at offset: b*dim_p_pe + g*kv_dim_p_pe + k
+    // K[b,k,:] at offset: b*kv_dim_p_pe*max_seq_len_p_pe + k*max_seq_len_p_pe
+    // score[b,g,:] at offset: b*gqa_group_size*Nt + g*Nt
+    //
+    // Inner group loop:
+    //   left_vector_dsd strides by kv_dim_p_pe between groups (Q[b,g,k] → Q[b,g+1,k])
+    //   out_vector_dsd strides by Nt between groups (score[b,g,:] → score[b,g+1,:])
+    //   right_matrix_dsd stays at K[b,k,:] (reloaded via save_address=false)
+    // After all groups, advance K to next row (+max_seq_len_p_pe), reset Q/out.
+
+    left_vector_dsd = @set_dsd_length(left_vector_dsd, 1);
+    right_matrix_dsd = @set_dsd_length(right_matrix_dsd, @bitcast(u16, Nt));
+    out_vector_dsd = @set_dsd_length(out_vector_dsd, @bitcast(u16, Nt));
+
+    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, &QKV_tile);
+    out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_score);
+    right_matrix_dsd = @set_dsd_base_addr(right_matrix_dsd, ptr_right_matrix);
+
+    // Precompute runtime reset offset (depends on runtime Nt = iter_num)
+    var out_group_reset: i16 = 0;
+
+    for (@range(i16, bsz)) |_| {
+        for (@range(i16, Kt)) |_| {
+            // For each K row: cycle through all GQA groups
+            for (@range(i16, gqa_group_size)) |_| {
+                @load_to_dsr(dest_dsr_1, out_vector_dsd, .{ .save_address = false });
+                @load_to_dsr(src0_dsr_1, out_vector_dsd, .{ .save_address = false });
+                @load_to_dsr(src1_dsr_1, right_matrix_dsd, .{ .save_address = false });
+                @map(gemv_static_step, left_vector_dsd);
+
+                // Advance Q to next group's k-th element: +kv_dim_p_pe
+                left_vector_dsd = @increment_dsd_offset(left_vector_dsd, kv_dim_p_pe, f16);
+                // Advance score to next group's output: +Nt
+                out_vector_dsd = @increment_dsd_offset(out_vector_dsd, Nt, f16);
+                // right_matrix_dsd stays at same K row (save_address=false preserves DSD base)
+            }
+
+            // After all groups for this K row:
+            //   left advanced by G*kv_dim_p_pe = dim_p_pe from row k start.
+            //   Want row k+1 start = +1 from row k start.
+            //   Delta: 1 - dim_p_pe
+            left_vector_dsd = @increment_dsd_offset(left_vector_dsd, 1 - dim_p_pe, f16);
+
+            // Reset out to this batch's score base (advanced by G*Nt, undo it)
+            out_group_reset = -gqa_group_size * Nt;
+            out_vector_dsd = @increment_dsd_offset(out_vector_dsd, out_group_reset, f16);
+
+            // Advance K to next row (forward only!)
+            right_matrix_dsd = @increment_dsd_offset(right_matrix_dsd, max_seq_len_p_pe, f16);
+            simprint.print_string(" score: ");
+            simprint_pe_coords_dsd(score_dsd);
+        }
+
+        // After all Kt rows for this batch:
+        //   left at: batch_start + kv_dim_p_pe (net +1 per row × Kt rows)
+        //   Want next batch: batch_start + dim_p_pe
+        //   Delta: dim_p_pe - kv_dim_p_pe = (G-1)*kv_dim_p_pe
+        left_vector_dsd = @increment_dsd_offset(left_vector_dsd, (gqa_group_size - 1) * kv_dim_p_pe, f16);
+
+        // Advance score to next batch (was reset to batch start after each K row)
+        out_vector_dsd = @increment_dsd_offset(out_vector_dsd, gqa_group_size * Nt, f16);
+
+        // right_matrix_dsd already advanced by Kt*max_seq_len_p_pe = next batch's K cache
+    }
+
+    // Snapshot 5a: copy full score buffer
+    // for (@range(i16, gqa_group_size * bsz * max_seq_len_p_pe)) |i| { score_post_gemv[i] = score[i]; }
+
+    // Phase 2: ONE batched variable-length KV-head-scoped X-reduce over all groups
+    comm_mod.all_reduce_bsz_g_var_seq_len_kv_head_scoped(px_in_kv_head, quotient_x_in_kv_head, remainder_x, ptr_score, iter_num);
+
+    // Phase 3: alpha scale — flat over all bsz * gqa_group_size * iter_num elements.
+    score_dsd = @set_dsd_length(score_dsd, @bitcast(u16, bsz * gqa_group_size * iter_num));
+    score_dsd = @set_dsd_base_addr(score_dsd, ptr_score);
+    @load_to_dsr(dest_dsr_1, score_dsd);
+    @load_to_dsr(src0_dsr_1, score_dsd);
+    @fmulh(dest_dsr_1, src0_dsr_1, alpha);
+
+    score_dsd = @set_dsd_length(score_dsd, @bitcast(u16, bsz * iter_num * gqa_group_size));
+
+    // Snapshot 5b: copy full score buffer
+    // for (@range(i16, gqa_group_size * bsz * max_seq_len_p_pe)) |i| { score_post_reduce[i] = score[i]; }
+}
+
+fn score_matvec_mult_k_outer_v2() void {
+    // Zero full max-capacity score buffer, then use iter_num-length GEMVs.
+    score_dsd = @set_dsd_length(score_dsd, @bitcast(u16, gqa_group_size * bsz * max_seq_len_p_pe));
+    score_dsd = @set_dsd_base_addr(score_dsd, ptr_score);
+    @fmovh(score_dsd, 0.0);
+    ptr_right_matrix = &XKCache_tile;
+    Kt = kv_dim_p_pe;
+    Nt = iter_num;
+
+    left_vector_dsd = @set_dsd_stride(left_vector_dsd, kv_dim_p_pe);
+    left_vector_dsd = @set_dsd_length(left_vector_dsd, gqa_group_size);
+    right_matrix_dsd = @set_dsd_length(right_matrix_dsd, @bitcast(u16, Nt));
+    out_vector_dsd = @set_dsd_length(out_vector_dsd, @bitcast(u16, Nt));
+
+    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, &QKV_tile);
+    out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_score);
+    right_matrix_dsd = @set_dsd_base_addr(right_matrix_dsd, ptr_right_matrix);
+
+    // Precompute runtime reset offset (depends on runtime Nt = iter_num)
+    var out_group_reset: i16 = 0;
+
+    for (@range(i16, bsz)) |_| {
+        for (@range(i16, Kt)) |_| {
+            @load_to_dsr(dest_dsr_1, out_vector_dsd, .{ .save_address = true });
+            @load_to_dsr(src0_dsr_1, out_vector_dsd, .{ .save_address = true });
+            @load_to_dsr(src1_dsr_1, right_matrix_dsd, .{ .save_address = false });
+            @map(gemv_static_step, left_vector_dsd);
+            left_vector_dsd = @increment_dsd_offset(left_vector_dsd, 1, f16);
+            right_matrix_dsd = @increment_dsd_offset(right_matrix_dsd, max_seq_len_p_pe, f16);
+            simprint.print_string(" score: ");
+            simprint_pe_coords_dsd(score_dsd);
+        }
+        left_vector_dsd = @increment_dsd_offset(left_vector_dsd, (gqa_group_size - 1) * kv_dim_p_pe, f16);
+        out_vector_dsd = @increment_dsd_offset(out_vector_dsd, gqa_group_size * Nt, f16);
+    }
+
+
+    // Snapshot 5a: copy full score buffer
+    // for (@range(i16, gqa_group_size * bsz * max_seq_len_p_pe)) |i| { score_post_gemv[i] = score[i]; }
+
+    // Phase 2: ONE batched variable-length KV-head-scoped X-reduce over all groups
+    comm_mod.all_reduce_bsz_g_var_seq_len_kv_head_scoped(px_in_kv_head, quotient_x_in_kv_head, remainder_x, ptr_score, iter_num);
+
+    // Phase 3: alpha scale — flat over all bsz * gqa_group_size * iter_num elements.
+    score_dsd = @set_dsd_length(score_dsd, @bitcast(u16, bsz * gqa_group_size * iter_num));
+    score_dsd = @set_dsd_base_addr(score_dsd, ptr_score);
+    @load_to_dsr(dest_dsr_1, score_dsd);
+    @load_to_dsr(src0_dsr_1, score_dsd);
+    @fmulh(dest_dsr_1, src0_dsr_1, alpha);
+
+    score_dsd = @set_dsd_length(score_dsd, @bitcast(u16, bsz * iter_num * gqa_group_size));
+
+    // Snapshot 5b: copy full score buffer
+    // for (@range(i16, gqa_group_size * bsz * max_seq_len_p_pe)) |i| { score_post_reduce[i] = score[i]; }
+}
+
+// -------------------------------------------------------------------------- //
+// ---- Test: compare score_matvec_mult_k_outer vs k_outer_v2 GEMV only ---- //
+// -------------------------------------------------------------------------- //
+// Runs the GEMV portion of both functions (no reduce, no alpha) on the same
+// Q and K data, storing results in score_post_gemv (v1) and score_v2_snapshot (v2).
+// Call from host as test_score_gemv(iter_num_val) after loading Q/K data.
+fn test_score_gemv(iter_num_val: i16) void {
+    iter_num = iter_num_val;
+
+    // ---- Run v0 (original group-outer) GEMV only ----
+    score_dsd = @set_dsd_length(score_dsd, @bitcast(u16, gqa_group_size * bsz * max_seq_len_p_pe));
+    score_dsd = @set_dsd_base_addr(score_dsd, ptr_score);
+    @fmovh(score_dsd, 0.0);
+
+    ptr_right_matrix = &XKCache_tile;
+    Kt = kv_dim_p_pe;
+    Nt = iter_num;
+
+    left_vector_dsd = @set_dsd_length(left_vector_dsd, 1);
+    right_matrix_dsd = @set_dsd_length(right_matrix_dsd, @bitcast(u16, Nt));
+    out_vector_dsd = @set_dsd_length(out_vector_dsd, @bitcast(u16, Nt));
+
+    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, &QKV_tile);
+    out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_score);
+    right_matrix_dsd = @set_dsd_base_addr(right_matrix_dsd, ptr_right_matrix);
+
+    for (@range(i16, bsz)) |_| {
+        for (@range(i16, gqa_group_size)) |_| {
+            @load_to_dsr(dest_dsr_1, out_vector_dsd, .{ .save_address = false });
+            @load_to_dsr(src0_dsr_1, out_vector_dsd, .{ .save_address = false });
+            for (@range(i16, Kt)) |_| {
+                @load_to_dsr(src1_dsr_1, right_matrix_dsd, .{ .save_address = false });
+                @map(gemv_static_step, left_vector_dsd);
+                left_vector_dsd = @increment_dsd_offset(left_vector_dsd, 1, f16);
+                right_matrix_dsd = @increment_dsd_offset(right_matrix_dsd, max_seq_len_p_pe, f16);
+            }
+            right_matrix_dsd = @increment_dsd_offset(right_matrix_dsd, -kv_dim_p_pe * max_seq_len_p_pe, f16);
+            out_vector_dsd = @increment_dsd_offset(out_vector_dsd, Nt, f16);
+        }
+        right_matrix_dsd = @increment_dsd_offset(right_matrix_dsd, kv_dim_p_pe * max_seq_len_p_pe, f16);
+    }
+
+    // Save v0 result
+    for (@range(i16, gqa_group_size * bsz * max_seq_len_p_pe)) |i| { score_v0_snapshot[i] = score[i]; }
+
+    // ---- Run v1 (k_outer) GEMV only ----
+    score_dsd = @set_dsd_length(score_dsd, @bitcast(u16, gqa_group_size * bsz * max_seq_len_p_pe));
+    score_dsd = @set_dsd_base_addr(score_dsd, ptr_score);
+    @fmovh(score_dsd, 0.0);
+
+    ptr_right_matrix = &XKCache_tile;
+    Kt = kv_dim_p_pe;
+    Nt = iter_num;
+
+    left_vector_dsd = @set_dsd_length(left_vector_dsd, 1);
+    right_matrix_dsd = @set_dsd_length(right_matrix_dsd, @bitcast(u16, Nt));
+    out_vector_dsd = @set_dsd_length(out_vector_dsd, @bitcast(u16, Nt));
+
+    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, &QKV_tile);
+    out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_score);
+    right_matrix_dsd = @set_dsd_base_addr(right_matrix_dsd, ptr_right_matrix);
+
+    var out_reset_v1: i16 = 0;
+    for (@range(i16, bsz)) |_| {
+        for (@range(i16, Kt)) |_| {
+            for (@range(i16, gqa_group_size)) |_| {
+                @load_to_dsr(dest_dsr_1, out_vector_dsd, .{ .save_address = false });
+                @load_to_dsr(src0_dsr_1, out_vector_dsd, .{ .save_address = false });
+                @load_to_dsr(src1_dsr_1, right_matrix_dsd, .{ .save_address = false });
+                @map(gemv_static_step, left_vector_dsd);
+                left_vector_dsd = @increment_dsd_offset(left_vector_dsd, kv_dim_p_pe, f16);
+                out_vector_dsd = @increment_dsd_offset(out_vector_dsd, Nt, f16);
+            }
+            left_vector_dsd = @increment_dsd_offset(left_vector_dsd, 1 - dim_p_pe, f16);
+            out_reset_v1 = -gqa_group_size * Nt;
+            out_vector_dsd = @increment_dsd_offset(out_vector_dsd, out_reset_v1, f16);
+            right_matrix_dsd = @increment_dsd_offset(right_matrix_dsd, max_seq_len_p_pe, f16);
+        }
+        left_vector_dsd = @increment_dsd_offset(left_vector_dsd, (gqa_group_size - 1) * kv_dim_p_pe, f16);
+        out_vector_dsd = @increment_dsd_offset(out_vector_dsd, gqa_group_size * Nt, f16);
+    }
+
+    // Save v1 result
+    for (@range(i16, gqa_group_size * bsz * max_seq_len_p_pe)) |i| { score_post_gemv[i] = score[i]; }
+
+    // ---- Run v2 (k_outer_v2) GEMV only ----
+    score_dsd = @set_dsd_length(score_dsd, @bitcast(u16, gqa_group_size * bsz * max_seq_len_p_pe));
+    score_dsd = @set_dsd_base_addr(score_dsd, ptr_score);
+    @fmovh(score_dsd, 0.0);
+    ptr_right_matrix = &XKCache_tile;
+    Kt = kv_dim_p_pe;
+    Nt = iter_num;
+
+    left_vector_dsd = @set_dsd_stride(left_vector_dsd, kv_dim_p_pe);
+    left_vector_dsd = @set_dsd_length(left_vector_dsd, gqa_group_size);
+    right_matrix_dsd = @set_dsd_length(right_matrix_dsd, @bitcast(u16, Nt));
+    out_vector_dsd = @set_dsd_length(out_vector_dsd, @bitcast(u16, Nt));
+
+    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, &QKV_tile);
+    out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_score);
+    right_matrix_dsd = @set_dsd_base_addr(right_matrix_dsd, ptr_right_matrix);
+
+    for (@range(i16, bsz)) |_| {
+        for (@range(i16, Kt)) |_| {
+            @load_to_dsr(dest_dsr_1, out_vector_dsd, .{ .save_address = true });
+            @load_to_dsr(src0_dsr_1, out_vector_dsd, .{ .save_address = true });
+            @load_to_dsr(src1_dsr_1, right_matrix_dsd, .{ .save_address = false });
+            @map(gemv_static_step, left_vector_dsd);
+            left_vector_dsd = @increment_dsd_offset(left_vector_dsd, 1, f16);
+            right_matrix_dsd = @increment_dsd_offset(right_matrix_dsd, max_seq_len_p_pe, f16);
+        }
+        left_vector_dsd = @increment_dsd_offset(left_vector_dsd, (gqa_group_size - 1) * kv_dim_p_pe, f16);
+        out_vector_dsd = @increment_dsd_offset(out_vector_dsd, gqa_group_size * Nt, f16);
+    }
+
+    // Save v2 result
+    for (@range(i16, gqa_group_size * bsz * max_seq_len_p_pe)) |i| { score_v2_snapshot[i] = score[i]; }
+
+    sys_mod.unblock_cmd_stream();
+}
+
 
 fn softmax_score_all_groups() void {
     // Set iter_num length on the score-row DSDs used throughout this function.
@@ -1082,7 +1377,8 @@ fn decode_struct() void {
     process_kv();  // write K,V to on-chip cache at iter_num (only py == step % P writes)
 
     timestamp.get_timestamp(&prof_tsc_1);
-    score_matvec_mult();  // gqa_group_size GEMVs + kv-head-scoped reduces inside
+    // score_matvec_mult();  // gqa_group_size GEMVs + kv-head-scoped reduces inside
+    score_matvec_mult_k_outer_v2();
 
     timestamp.get_timestamp(&prof_tsc_2);
     comm_mod.reconfig_allreduce_axis(1);
@@ -1262,6 +1558,9 @@ comptime {
 comptime {
     @export_symbol(init_task, "init_task");
     @export_symbol(decode_host, "decode_host");
+    @export_symbol(test_score_gemv, "test_score_gemv");
+    @export_symbol(ptr_score_v2_snapshot, "score_v2_snapshot");
+    @export_symbol(ptr_score_v0_snapshot, "score_v0_snapshot");
 }
 
 comptime {
