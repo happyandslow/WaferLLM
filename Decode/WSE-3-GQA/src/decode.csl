@@ -481,9 +481,9 @@ var score: [gqa_group_size * bsz * max_seq_len_p_pe]f16 = @zeros([gqa_group_size
 var ptr_score: [*]f16 = &score;
 var score_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &score, .extent = bsz * max_seq_len_p_pe * gqa_group_size});
 
-var score_tmp: [bsz * max_seq_len_p_pe]f16 = @zeros([bsz * max_seq_len_p_pe]f16);
+var score_tmp: [gqa_group_size * bsz * max_seq_len_p_pe]f16 = @zeros([gqa_group_size * bsz * max_seq_len_p_pe]f16);
 var ptr_score_tmp: [*]f16 = &score_tmp;
-var score_tmp_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &score_tmp, .extent = bsz * max_seq_len_p_pe });
+var score_tmp_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &score_tmp, .extent = gqa_group_size * bsz * max_seq_len_p_pe });
 
 var score_post_gemv:   [gqa_group_size * bsz * max_seq_len_p_pe]f16 = @zeros([gqa_group_size * bsz * max_seq_len_p_pe]f16);
 var ptr_score_post_gemv: [*]f16 = &score_post_gemv;
@@ -1083,6 +1083,36 @@ fn test_score_gemv(iter_num_val: i16) void {
     sys_mod.unblock_cmd_stream();
 }
 
+// Test: run both softmax variants on the same input score data and save results.
+// Expects score buffer to be pre-populated (e.g. via H2D with random data).
+// Results: score_post_gemv = v1 output, score (ptr_score) = v2 output.
+fn test_softmax(iter_num_val: i16) void {
+    iter_num = iter_num_val;
+
+    // Backup input score → score_v0_snapshot
+    for (@range(i16, gqa_group_size * bsz * max_seq_len_p_pe)) |i| {
+        score_v0_snapshot[i] = score[i];
+    }
+
+    // Run v1
+    softmax_score_all_groups();
+
+    // Save v1 result → score_post_gemv
+    for (@range(i16, gqa_group_size * bsz * max_seq_len_p_pe)) |i| {
+        score_post_gemv[i] = score[i];
+    }
+
+    // Restore input score from backup
+    for (@range(i16, gqa_group_size * bsz * max_seq_len_p_pe)) |i| {
+        score[i] = score_v0_snapshot[i];
+    }
+
+    // Run v2 — result stays in score buffer
+    softmax_score_all_groups_v2();
+
+    sys_mod.unblock_cmd_stream();
+}
+
 
 fn softmax_score_all_groups() void {
     // Set iter_num length on the score-row DSDs used throughout this function.
@@ -1104,7 +1134,6 @@ fn softmax_score_all_groups() void {
             max_seq_len_p_pe_dsd_1 = @increment_dsd_offset(max_seq_len_p_pe_dsd_1, iter_num, f16);
         }
     }
-
     // Step 2: ONE Y-reduce-max over gqa_group_size * bsz scalars
     comm_mod.all_reduceMax_bsz_g(py, quotient_y, remainder_y, &local_max_g);
 
@@ -1163,12 +1192,93 @@ fn softmax_score_all_groups() void {
     @load_to_dsr(dest_dsr_1, max_seq_len_p_pe_dsd_1, .{ .save_address = true });
     @load_to_dsr(src0_dsr_1, max_seq_len_p_pe_dsd_1, .{ .save_address = true });
     @map(fmulh_softmax_func, local_sum_g_dsd);
-
     // Restore local_max_dsd and local_sum_dsd base addresses for other callers
     local_max_g_dsd = @set_dsd_base_addr(local_max_g_dsd, &local_max_g);
     local_sum_g_dsd = @set_dsd_base_addr(local_sum_g_dsd, &local_sum_g);
 
 }
+
+fn softmax_score_all_groups_v2() void {
+    // Set iter_num length on the score-row DSDs used throughout this function.
+    max_seq_len_p_pe_dsd_1 = @set_dsd_length(max_seq_len_p_pe_dsd_1, @bitcast(u16, iter_num));
+    max_seq_len_p_pe_dsd_2 = @set_dsd_length(max_seq_len_p_pe_dsd_2, @bitcast(u16, iter_num));
+
+    // // Step 1: local max for each (b, g) pair → local_max_g[b*gqa_group_size + g]
+    // // Score is BATCH-OUTER: [b0_g0, b0_g1, ..., b1_g0, b1_g1, ...]
+    // // Load DSR ONCE — save_address=true auto-advances by iter_num per @fmaxh,
+    // // sequentially reading all bsz*gqa_group_size sub-blocks in batch-outer order.
+    max_seq_len_p_pe_dsd_1 = @set_dsd_base_addr(max_seq_len_p_pe_dsd_1, ptr_score);
+    max_seq_len_p_pe_dsd_1 = @set_dsd_length(max_seq_len_p_pe_dsd_1, @bitcast(u16, iter_num));
+    @fmovh(local_max_g_dsd, -65504.0);
+    
+    for (@range(i16, bsz * gqa_group_size)) |i| {
+        max = 0.0;
+        @load_to_dsr(src1_dsr_1, max_seq_len_p_pe_dsd_1, .{ .save_address = false });
+        @fmaxh(ptr_max, max, src1_dsr_1);
+        local_max_g[i] = max;
+        max_seq_len_p_pe_dsd_1 = @increment_dsd_offset(max_seq_len_p_pe_dsd_1, iter_num, f16);
+    }
+
+    // Step 2: ONE Y-reduce-max over gqa_group_size * bsz scalars
+    comm_mod.all_reduceMax_bsz_g(py, quotient_y, remainder_y, &local_max_g);
+
+    // Step 3: subtract global max + apply exp → score in place.
+    // Processes bsz sub-blocks per outer iteration, gqa_group_size iterations total.
+    // score_tmp is sized [bsz * max_seq_len_p_pe] so chunk size = bsz * iter_num.
+    // Sequential access through local_max_g matches score's batch-outer order
+    // because Step 1 stored maxes in the same sequential order.
+    // Each iteration: (a) score_tmp = score_chunk - max_chunk, (b) score_chunk = exp(score_tmp).
+
+    max_seq_len_p_pe_dsd_1 = @set_dsd_length(max_seq_len_p_pe_dsd_1, @bitcast(u16, iter_num));
+    max_seq_len_p_pe_dsd_2 = @set_dsd_length(max_seq_len_p_pe_dsd_2, @bitcast(u16, iter_num));
+    score_tmp_dsd = @set_dsd_length(score_tmp_dsd, @bitcast(u16, bsz * iter_num * gqa_group_size));
+    score_dsd = @set_dsd_length(score_dsd, @bitcast(u16, bsz * iter_num * gqa_group_size));
+
+    max_seq_len_p_pe_dsd_1 = @set_dsd_base_addr(max_seq_len_p_pe_dsd_1, ptr_score_tmp);
+    max_seq_len_p_pe_dsd_2 = @set_dsd_base_addr(max_seq_len_p_pe_dsd_2, ptr_score);
+    
+    @load_to_dsr(dest_dsr_1, max_seq_len_p_pe_dsd_1, .{ .save_address = true });
+    @load_to_dsr(src0_dsr_1, max_seq_len_p_pe_dsd_2, .{ .save_address = true });
+    @map(fsubh_func, local_max_g_dsd);
+
+    @map(fast_exp, score_tmp_dsd, score_dsd);
+
+    score_dsd = @set_dsd_length(score_dsd, @bitcast(u16, bsz * max_seq_len_p_pe * gqa_group_size));
+    score_dsd = @set_dsd_base_addr(score_dsd, ptr_score);
+
+    // Step 4: local sum for each (b, g) pair → local_sum_g[b*gqa_group_size + g]
+    // Score is BATCH-OUTER: DSR reads gqa_group_size groups per batch.
+    // Load DSR once per batch (outside g loop), advance gqa_group_size times.
+    max_seq_len_p_pe_dsd_1 = @set_dsd_base_addr(max_seq_len_p_pe_dsd_1, ptr_score);
+    max_seq_len_p_pe_dsd_1 = @set_dsd_length(max_seq_len_p_pe_dsd_1, @bitcast(u16, iter_num));
+    @fmovh(local_sum_g_dsd, 0.0);
+    
+    for (@range(i16, bsz * gqa_group_size)) |i| {
+        sum = 0.0;
+        @load_to_dsr(src1_dsr_1, max_seq_len_p_pe_dsd_1, .{ .save_address = false });
+        @faddh(ptr_sum, sum, src1_dsr_1);
+        local_sum_g[i] = sum;
+        max_seq_len_p_pe_dsd_1 = @increment_dsd_offset(max_seq_len_p_pe_dsd_1, iter_num, f16);
+    }
+
+    // Step 5: ONE Y-reduce-sum over gqa_group_size * bsz scalars
+    comm_mod.all_reduce_bsz_g(py, quotient_y, remainder_y, &local_sum_g);
+
+    // Step 6: divide each score sub-block by its global sum.
+    // Processes bsz sub-blocks per outer iteration, gqa_group_size iterations total.
+    // Sequential access through local_sum_g matches score's batch-outer order
+    // because Step 4 stored sums in the same sequential order.
+    // save_address=true so DSR advances by iter_num per fmulh_softmax_func call.
+    max_seq_len_p_pe_dsd_1 = @set_dsd_base_addr(max_seq_len_p_pe_dsd_1, ptr_score);
+    @load_to_dsr(dest_dsr_1, max_seq_len_p_pe_dsd_1, .{ .save_address = true });
+    @load_to_dsr(src0_dsr_1, max_seq_len_p_pe_dsd_1, .{ .save_address = true });
+    @map(fmulh_softmax_func, local_sum_g_dsd);
+    // Restore local_max_dsd and local_sum_dsd base addresses for other callers
+    local_max_g_dsd = @set_dsd_base_addr(local_max_g_dsd, &local_max_g);
+    local_sum_g_dsd = @set_dsd_base_addr(local_sum_g_dsd, &local_sum_g);
+
+}
+
 
 fn output_matvec_mult_all_groups() void {
     // Output GEMV: attn[b,g] @ V → output[b,g] for all (b,g) pairs.
@@ -1377,14 +1487,15 @@ fn decode_struct() void {
     process_kv();  // write K,V to on-chip cache at iter_num (only py == step % P writes)
 
     timestamp.get_timestamp(&prof_tsc_1);
-    // score_matvec_mult();  // gqa_group_size GEMVs + kv-head-scoped reduces inside
-    score_matvec_mult_k_outer_v2();
+    score_matvec_mult();  // gqa_group_size GEMVs + kv-head-scoped reduces inside
+    //score_matvec_mult_k_outer_v2();
 
     timestamp.get_timestamp(&prof_tsc_2);
     comm_mod.reconfig_allreduce_axis(1);
 
     @fmovh(output_dsd, 0.0);
-    softmax_score_all_groups();       // 2 Y-reduces total (1 max + 1 sum), batched over all groups
+    // softmax_score_all_groups();       // 2 Y-reduces total (1 max + 1 sum), batched over all groups
+    softmax_score_all_groups_v2();
 
     timestamp.get_timestamp(&prof_tsc_3);
     output_matvec_mult_all_groups();  // G local GEMVs, no sync
@@ -1559,6 +1670,7 @@ comptime {
     @export_symbol(init_task, "init_task");
     @export_symbol(decode_host, "decode_host");
     @export_symbol(test_score_gemv, "test_score_gemv");
+    @export_symbol(test_softmax, "test_softmax");
     @export_symbol(ptr_score_v2_snapshot, "score_v2_snapshot");
     @export_symbol(ptr_score_v0_snapshot, "score_v0_snapshot");
 }
