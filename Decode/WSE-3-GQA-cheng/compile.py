@@ -57,7 +57,7 @@ def main():
     )
 
     cmd = (
-        f"cslc --arch=wse3 ./src/layout_gqa.csl "
+        f"cslc --arch=wse3 ./src/layout_gqa_full.csl "
         f"--fabric-dims={fabric_w},{fabric_h} --fabric-offsets=4,1 "
         f"--params={params} "
         f"-o out --memcpy --channels {channels}"

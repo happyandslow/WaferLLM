@@ -29,8 +29,12 @@ class Config:
         self.ffn_dim = 64
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="GQA decode simulator")
+    parser = argparse.ArgumentParser(description="GQA decode simulator/launcher")
     parser.add_argument("--config", default="config.json", type=str, help="Config file")
+    parser.add_argument("--cmaddr", type=str, default=None,
+                        help="CM address for hardware execution (via SdkLauncher)")
+    parser.add_argument("--steps", type=int, default=1,
+                        help="Total decode steps to run (default 1)")
     args = parser.parse_args()
     return args
 
@@ -109,7 +113,10 @@ def main():
     # ------------------------------ Runner setup ----------------------------- #
     # -------------------------------------------------------------------------- #
 
-    runner = SdkRuntime("out", simfab_numthreads=64, msg_level='INFO')
+    if args.cmaddr:
+        runner = SdkRuntime("out", cmaddr=args.cmaddr)
+    else:
+        runner = SdkRuntime("out", simfab_numthreads=64, msg_level='INFO')
     runner.load()
     runner.run()
 
@@ -252,7 +259,7 @@ def main():
 
     runner.launch("init_task", nonblock=False)
 
-    repeat_steps = 1
+    repeat_steps = args.steps
     warmup_steps = 0
     runner.launch("decode_host", np.int16(repeat_steps), np.int16(warmup_steps), nonblock=False)
 
@@ -302,8 +309,18 @@ def main():
         for pe_y in range(P):
             cycles_count[pe_y, pe_x] = calculate_cycles(timer_buf_time_hwl[pe_y, pe_x, :])
 
-    cycles_count_mean = cycles_count.mean()
-    print(f"Host: mean cycles count: {cycles_count_mean / repeat_steps}")
+    c = cycles_count.flatten() / repeat_steps
+    print(f"\n--- Cycle statistics across {P}x{P} PEs (per iteration) ---")
+    print(f"  mean   = {c.mean():.0f}")
+    print(f"  median = {np.median(c):.0f}")
+    print(f"  std    = {c.std():.0f}")
+    print(f"  min    = {c.min():.0f}")
+    print(f"  max    = {c.max():.0f}")
+    print(f"  p5     = {np.percentile(c, 5):.0f}")
+    print(f"  p25    = {np.percentile(c, 25):.0f}")
+    print(f"  p75    = {np.percentile(c, 75):.0f}")
+    print(f"  p95    = {np.percentile(c, 95):.0f}")
+    print(f"  p99    = {np.percentile(c, 99):.0f}")
 
 if __name__ == "__main__":
     main()

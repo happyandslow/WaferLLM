@@ -64,11 +64,11 @@ def main():
     os.makedirs(staging_dir)
 
     shutil.copytree("out", os.path.join(staging_dir, "out"))
-    shutil.copy2("launch_sim.py", staging_dir)
+    shutil.copy2("launch_sim_gqa_full.py", staging_dir)
     shutil.copy2(args.config, staging_dir)
 
     run_cmd = (
-        f"cs_python launch_sim.py --config {config_basename} "
+        f"cs_python launch_sim_gqa_full.py --config {config_basename} "
         f"--steps {args.steps} --cmaddr %CMADDR%"
     )
 
