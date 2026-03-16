@@ -116,6 +116,10 @@ layout {
     @export_name("decode_host", fn(i16, i16)void);
     @export_name("test_score_gemv", fn(i16)void);
     @export_name("test_softmax", fn(i16)void);
+    @export_name("test_output_gemv", fn(i16)void);
+    @export_name("test_output_gemv_v2", fn(i16)void);
+    @export_name("test_output_gemv_v3", fn(i16)void);
+    @export_name("test_output_gemv_v4", fn(i16)void);
 
     @export_name("timer_buf", [*]f32, true);
     @export_name("time_ref", [*]f32, true);
