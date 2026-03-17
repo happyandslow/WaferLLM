@@ -262,7 +262,7 @@ def main():
     timer_buf_time_hwl = timer_buf_1d_u32.view(np.float32).reshape((P, P, 3))
 
     # D2H: per-function profiling timer
-    NUM_PROF_FNS = 3  # score_matvec_mult, softmax_score, output_matvec_mult
+    NUM_PROF_FNS = 11  # full forward pass phases
     prof_buf_1d = np.zeros(P * P * NUM_PROF_FNS * 3, dtype=np.uint32)
     runner.memcpy_d2h(
         prof_buf_1d, sym_prof_timer, 0, 0, P, P, NUM_PROF_FNS * 3,
@@ -313,7 +313,19 @@ def main():
     print(f"  p99    = {np.percentile(c, 99):.0f}")
 
     # ─── Per-function profiling ───────────────────────────────────────────────
-    prof_fn_names = ["score_matvec_mult", "softmax_score", "output_matvec_mult"]
+    prof_fn_names = [
+        "rmsnorm_x",
+        "qkv_proj_reduce",
+        "reconfig0_rope",
+        "score_gemv",
+        "reconfig1_softmax",
+        "output_gemv",
+        "reconfig0_o_proj",
+        "attn_res_rmsnorm_z",
+        "ffn_up_gate_reduce",
+        "silu_z3_down",
+        "ffn_res_reconfig",
+    ]
     for fn_idx, fn_name in enumerate(prof_fn_names):
         fn_cycles = np.zeros((P, P))
         for pe_x in range(P):
@@ -331,6 +343,21 @@ def main():
         print(f"  p75    = {np.percentile(fc, 75):.0f}")
         print(f"  p95    = {np.percentile(fc, 95):.0f}")
         print(f"  p99    = {np.percentile(fc, 99):.0f}")
+
+    # Compare sum of phases to overall
+    phase_sum = np.zeros((P, P))
+    for fn_idx in range(NUM_PROF_FNS):
+        for pe_x in range(P):
+            for pe_y in range(P):
+                phase_sum[pe_y, pe_x] += calculate_cycles(prof_hwl[pe_y, pe_x, fn_idx*3:(fn_idx+1)*3])
+    ps = phase_sum.flatten()
+    print(f"\n--- Sum of all phases (last iteration only) ---")
+    print(f"  mean   = {ps.mean():.0f}")
+    print(f"  std    = {ps.std():.0f}")
+    print(f"\n--- Overall for comparison ({repeat_steps} iters, per-iter) ---")
+    print(f"  mean   = {c.mean():.0f}")
+    print(f"  std    = {c.std():.0f}")
+    print(f"\n  Phase sum / Overall-per-iter = {ps.mean() / c.mean():.4f}")
 
 if __name__ == "__main__":
     main()

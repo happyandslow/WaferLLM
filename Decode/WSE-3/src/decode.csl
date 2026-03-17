@@ -84,14 +84,21 @@ var tsc_ref_buf = @zeros([timestamp.tsc_size_words]u16);
 var time_ref_f32 = @zeros([2]f32);
 var ptr_time_ref: [*]f32 = &time_ref_f32;
 
-// Per-function profiling: 3 functions (score_matvec_mult, softmax_score,
-// output_matvec_mult) → 4 boundary timestamps
+// Per-phase profiling: 11 phases of decode_struct → 12 boundary timestamps
 var prof_tsc_0 = @zeros([timestamp.tsc_size_words]u16);
 var prof_tsc_1 = @zeros([timestamp.tsc_size_words]u16);
 var prof_tsc_2 = @zeros([timestamp.tsc_size_words]u16);
 var prof_tsc_3 = @zeros([timestamp.tsc_size_words]u16);
+var prof_tsc_4 = @zeros([timestamp.tsc_size_words]u16);
+var prof_tsc_5 = @zeros([timestamp.tsc_size_words]u16);
+var prof_tsc_6 = @zeros([timestamp.tsc_size_words]u16);
+var prof_tsc_7 = @zeros([timestamp.tsc_size_words]u16);
+var prof_tsc_8 = @zeros([timestamp.tsc_size_words]u16);
+var prof_tsc_9 = @zeros([timestamp.tsc_size_words]u16);
+var prof_tsc_10 = @zeros([timestamp.tsc_size_words]u16);
+var prof_tsc_11 = @zeros([timestamp.tsc_size_words]u16);
 
-var prof_timer_buf = @zeros([9]f32); // 3 functions × 3 f32 each
+var prof_timer_buf = @zeros([33]f32); // 11 phases × 3 f32 each
 var ptr_prof_timer_buf: [*]f32 = &prof_timer_buf;
 
 // -------------------------------------------------------------------------- //
@@ -774,55 +781,55 @@ fn ffn_residual_add() void {
 
 fn decode_struct() void {
 
+    timestamp.get_timestamp(&prof_tsc_0);
     rmsnorm_x();
 
+    timestamp.get_timestamp(&prof_tsc_1);
     xq_matvec_mult();
     xk_matvec_mult();
     xv_matvec_mult();
     comm_mod.all_reduce_bsz_dim_QKV_fusion(py, quotient_y, remainder_y, ptr_QKV_tile);
 
+    timestamp.get_timestamp(&prof_tsc_2);
     comm_mod.reconfig_allreduce_axis(0); // 0: px row-wise, 1: py col-wise
-
     xq_rope();
     xk_rope();
 
-    timestamp.get_timestamp(&prof_tsc_0);
+    timestamp.get_timestamp(&prof_tsc_3);
     score_matvec_mult();
 
-    timestamp.get_timestamp(&prof_tsc_1);
+    timestamp.get_timestamp(&prof_tsc_4);
     comm_mod.reconfig_allreduce_axis(1);
-
     softmax_score();
 
-    timestamp.get_timestamp(&prof_tsc_2);
+    timestamp.get_timestamp(&prof_tsc_5);
     output_matvec_mult();
-    timestamp.get_timestamp(&prof_tsc_3);
 
+    timestamp.get_timestamp(&prof_tsc_6);
     comm_mod.reconfig_allreduce_axis(0);
-
     o_matvec_mult();
 
+    timestamp.get_timestamp(&prof_tsc_7);
     attn_residual_add();
-
     comm_mod.reconfig_allreduce_axis(1);
-
     rmsnorm_z();
 
+    timestamp.get_timestamp(&prof_tsc_8);
     up_matvec_mult();
     gate_matvec_mult();
     comm_mod.all_reduce_bsz_ffn_dim_ZZ_fusion(py, quotient_y, remainder_y, ptr_ZZ_tile);
 
+    timestamp.get_timestamp(&prof_tsc_9);
     z2_silu();
-
     z3_mat();
-
     comm_mod.reconfig_allreduce_axis(0);
-
     down_matvec_mult();
 
+    timestamp.get_timestamp(&prof_tsc_10);
     ffn_residual_add();
-
     comm_mod.reconfig_allreduce_axis(1);
+
+    timestamp.get_timestamp(&prof_tsc_11);
 
     decode_entry();
 }
@@ -895,7 +902,7 @@ fn f_pack_prof_timestamps() void {
     var lo_p: u16 = 0;
     var hi_p: u16 = 0;
 
-    // Function 0: score_matvec_mult (prof_tsc_0 → prof_tsc_1)
+    // Phase 0: rmsnorm_x (prof_tsc_0 → prof_tsc_1)
     lo_p = prof_tsc_0[0]; hi_p = prof_tsc_0[1];
     prof_timer_buf[0] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
     lo_p = prof_tsc_0[2]; hi_p = prof_tsc_1[0];
@@ -903,7 +910,7 @@ fn f_pack_prof_timestamps() void {
     lo_p = prof_tsc_1[1]; hi_p = prof_tsc_1[2];
     prof_timer_buf[2] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
 
-    // Function 1: softmax_score (prof_tsc_1 → prof_tsc_2)
+    // Phase 1: qkv_proj_reduce (prof_tsc_1 → prof_tsc_2)
     lo_p = prof_tsc_1[0]; hi_p = prof_tsc_1[1];
     prof_timer_buf[3] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
     lo_p = prof_tsc_1[2]; hi_p = prof_tsc_2[0];
@@ -911,13 +918,77 @@ fn f_pack_prof_timestamps() void {
     lo_p = prof_tsc_2[1]; hi_p = prof_tsc_2[2];
     prof_timer_buf[5] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
 
-    // Function 2: output_matvec_mult (prof_tsc_2 → prof_tsc_3)
+    // Phase 2: reconfig0_rope (prof_tsc_2 → prof_tsc_3)
     lo_p = prof_tsc_2[0]; hi_p = prof_tsc_2[1];
     prof_timer_buf[6] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
     lo_p = prof_tsc_2[2]; hi_p = prof_tsc_3[0];
     prof_timer_buf[7] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
     lo_p = prof_tsc_3[1]; hi_p = prof_tsc_3[2];
     prof_timer_buf[8] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+
+    // Phase 3: score_gemv (prof_tsc_3 → prof_tsc_4)
+    lo_p = prof_tsc_3[0]; hi_p = prof_tsc_3[1];
+    prof_timer_buf[9] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+    lo_p = prof_tsc_3[2]; hi_p = prof_tsc_4[0];
+    prof_timer_buf[10] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+    lo_p = prof_tsc_4[1]; hi_p = prof_tsc_4[2];
+    prof_timer_buf[11] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+
+    // Phase 4: reconfig1_softmax (prof_tsc_4 → prof_tsc_5)
+    lo_p = prof_tsc_4[0]; hi_p = prof_tsc_4[1];
+    prof_timer_buf[12] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+    lo_p = prof_tsc_4[2]; hi_p = prof_tsc_5[0];
+    prof_timer_buf[13] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+    lo_p = prof_tsc_5[1]; hi_p = prof_tsc_5[2];
+    prof_timer_buf[14] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+
+    // Phase 5: output_gemv (prof_tsc_5 → prof_tsc_6)
+    lo_p = prof_tsc_5[0]; hi_p = prof_tsc_5[1];
+    prof_timer_buf[15] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+    lo_p = prof_tsc_5[2]; hi_p = prof_tsc_6[0];
+    prof_timer_buf[16] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+    lo_p = prof_tsc_6[1]; hi_p = prof_tsc_6[2];
+    prof_timer_buf[17] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+
+    // Phase 6: reconfig0_o_proj (prof_tsc_6 → prof_tsc_7)
+    lo_p = prof_tsc_6[0]; hi_p = prof_tsc_6[1];
+    prof_timer_buf[18] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+    lo_p = prof_tsc_6[2]; hi_p = prof_tsc_7[0];
+    prof_timer_buf[19] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+    lo_p = prof_tsc_7[1]; hi_p = prof_tsc_7[2];
+    prof_timer_buf[20] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+
+    // Phase 7: attn_res_rmsnorm_z (prof_tsc_7 → prof_tsc_8)
+    lo_p = prof_tsc_7[0]; hi_p = prof_tsc_7[1];
+    prof_timer_buf[21] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+    lo_p = prof_tsc_7[2]; hi_p = prof_tsc_8[0];
+    prof_timer_buf[22] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+    lo_p = prof_tsc_8[1]; hi_p = prof_tsc_8[2];
+    prof_timer_buf[23] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+
+    // Phase 8: ffn_up_gate_reduce (prof_tsc_8 → prof_tsc_9)
+    lo_p = prof_tsc_8[0]; hi_p = prof_tsc_8[1];
+    prof_timer_buf[24] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+    lo_p = prof_tsc_8[2]; hi_p = prof_tsc_9[0];
+    prof_timer_buf[25] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+    lo_p = prof_tsc_9[1]; hi_p = prof_tsc_9[2];
+    prof_timer_buf[26] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+
+    // Phase 9: silu_z3_down (prof_tsc_9 → prof_tsc_10)
+    lo_p = prof_tsc_9[0]; hi_p = prof_tsc_9[1];
+    prof_timer_buf[27] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+    lo_p = prof_tsc_9[2]; hi_p = prof_tsc_10[0];
+    prof_timer_buf[28] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+    lo_p = prof_tsc_10[1]; hi_p = prof_tsc_10[2];
+    prof_timer_buf[29] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+
+    // Phase 10: ffn_res_reconfig (prof_tsc_10 → prof_tsc_11)
+    lo_p = prof_tsc_10[0]; hi_p = prof_tsc_10[1];
+    prof_timer_buf[30] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+    lo_p = prof_tsc_10[2]; hi_p = prof_tsc_11[0];
+    prof_timer_buf[31] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
+    lo_p = prof_tsc_11[1]; hi_p = prof_tsc_11[2];
+    prof_timer_buf[32] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
 }
 
 fn f_reference_timestamps() void {
