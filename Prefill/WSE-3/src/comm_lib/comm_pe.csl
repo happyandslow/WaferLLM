@@ -1,0 +1,675 @@
+param P: i16;
+
+param dim_p_pe: i16;
+param seq_len_p_pe: i16;
+param ffn_dim_p_pe: i16;
+
+param shift_reverse: bool;
+
+var px: i16 = 0;
+var py: i16 = 0;
+
+const _dim_dim: i16 = ((dim_p_pe*dim_p_pe) / 4) * 4;
+const _seqLen_dim: i16 = ((seq_len_p_pe*dim_p_pe) / 4) * 4;
+const _seqLen_seqLen: i16 = ((seq_len_p_pe*seq_len_p_pe) / 4) * 4;
+const _ffnDim_dim: i16 = ((ffn_dim_p_pe*dim_p_pe) / 4) * 4;
+const _seqLen_ffnDim: i16 = ((seq_len_p_pe*ffn_dim_p_pe) / 4) * 4;
+
+var root: i16 = 0;
+
+var is_first_px: bool = false;
+var is_last_px: bool = false;
+
+// ===== Allreduce colors (4 directional, no even/odd) =====
+param c_right_send: color;
+param c_right_recv: color;
+param c_left_send: color;
+param c_left_recv: color;
+
+// ===== Two-hop colors =====
+param x_send_color: color;
+param x_recv_color: color;
+param x_tran_color: color;
+
+param x_shift_send_color: color;
+param x_shift_recv_color: color;
+param x_shift_tran_color: color;
+
+param x_shift_re_send_color: color;
+param x_shift_re_recv_color: color;
+param x_shift_re_tran_color: color;
+
+param y_send_color: color;
+param y_recv_color: color;
+param y_tran_color: color;
+
+// ===== Queue allocation =====
+// Allreduce queues
+const right_recv_queue_id = @get_input_queue(2);
+const right_send_queue_id = @get_output_queue(1);
+const left_recv_queue_id = @get_input_queue(3);
+const left_send_queue_id = @get_output_queue(2);
+
+// Two-hop queues (x_recv moved from IQ 1 to IQ 5 since IQ 1 is memcpy-reserved on WSE-3)
+const x_recv_queue_id = @get_input_queue(5);
+const x_send_queue_id = @get_output_queue(3);
+const y_recv_queue_id = @get_input_queue(4);
+const y_send_queue_id = @get_output_queue(4);
+const x_shift_recv_queue_id = @get_input_queue(6);
+const x_shift_send_queue_id = @get_output_queue(5);
+const x_shift_re_recv_queue_id = @get_input_queue(7);
+const x_shift_re_send_queue_id = @get_output_queue(6);
+
+// ===== Microthreads (WSE-3) =====
+const ut1 = @get_ut_id(1);
+const ut2 = @get_ut_id(2);
+const ut3 = @get_ut_id(3);
+const ut4 = @get_ut_id(4);
+
+// ===== DSR registers =====
+const left_send_dsr = @get_dsr(dsr_src1, 3);
+const left_recv_dsr = @get_dsr(dsr_dest, 3);
+
+const right_send_dsr = @get_dsr(dsr_src1, 4);
+const right_recv_dsr = @get_dsr(dsr_dest, 4);
+
+const left_matrix_shift_finish_id: local_task_id = @get_local_task_id(26);
+
+param left_matrix_finish_id: local_task_id;
+param right_matrix_finish_id: local_task_id;
+param left_matrix_shift_callback: fn ()void;
+
+var right_matrix_send_dsd_seqLen_dim = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{_seqLen_dim} -> dummy[i] });
+var right_matrix_recv_dsd_seqLen_dim = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{_seqLen_dim} -> dummy[i] });
+
+task left_matrix_shift_finish() void {
+    @block(left_matrix_shift_finish_id);
+    left_matrix_shift_callback();
+}
+
+const math_lib = @import_module("<math>");
+
+fn init_(_px: i16, _py: i16) void {
+    px = _px;
+    py = _py;
+
+    root = P / 2;
+
+    if (px == 0) {
+        is_first_px = true;
+    }
+
+    if (px == P-1) {
+        is_last_px = true;
+    }
+}
+
+const dummy = @zeros([1]f16);
+
+var left_matrix_send_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> dummy[i] });
+var left_matrix_recv_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> dummy[i] });
+
+var right_matrix_send_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> dummy[i] });
+var right_matrix_recv_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> dummy[i] });
+
+// ===== Allreduce DSDs (WSE-3: with queues and simd_64) =====
+const mv_right_send = @get_dsd(fabout_dsd, .{
+    .extent = seq_len_p_pe,
+    .fabric_color = c_right_send,
+    .output_queue = right_send_queue_id,
+    .simd_mode = .{ .simd_64 = true },
+});
+
+const mv_right_recv = @get_dsd(fabin_dsd, .{
+    .extent = seq_len_p_pe,
+    .fabric_color = c_right_recv,
+    .input_queue = right_recv_queue_id,
+    .simd_mode = .{ .simd_64 = true },
+});
+
+const mv_left_send = @get_dsd(fabout_dsd, .{
+    .extent = seq_len_p_pe,
+    .fabric_color = c_left_send,
+    .output_queue = left_send_queue_id,
+    .simd_mode = .{ .simd_64 = true },
+});
+
+const mv_left_recv = @get_dsd(fabin_dsd, .{
+    .extent = seq_len_p_pe,
+    .fabric_color = c_left_recv,
+    .input_queue = left_recv_queue_id,
+    .simd_mode = .{ .simd_64 = true },
+});
+
+// Max variants (same queues/colors, no SIMD for element-wise max)
+const mv_right_send_max = @get_dsd(fabout_dsd, .{
+    .extent = seq_len_p_pe,
+    .fabric_color = c_right_send,
+    .output_queue = right_send_queue_id,
+});
+
+const mv_right_recv_max = @get_dsd(fabin_dsd, .{
+    .extent = seq_len_p_pe,
+    .fabric_color = c_right_recv,
+    .input_queue = right_recv_queue_id,
+});
+
+const mv_left_send_max = @get_dsd(fabout_dsd, .{
+    .extent = seq_len_p_pe,
+    .fabric_color = c_left_send,
+    .output_queue = left_send_queue_id,
+});
+
+const mv_left_recv_max = @get_dsd(fabin_dsd, .{
+    .extent = seq_len_p_pe,
+    .fabric_color = c_left_recv,
+    .input_queue = left_recv_queue_id,
+});
+
+var vector_buf_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe} -> dummy[i] });
+const vector_buf_dsr = @get_dsr(dsr_src1, 2);
+
+// ===== Allreduce functions =====
+// WSE-3: Uses software relay for broadcast (reusing reduce colors in reverse direction)
+// instead of separate broadcast colors, to save queues.
+
+fn mv_allreduce_max_x(vector_buf_ptr: [*]f16) void {
+    vector_buf_dsd = @set_dsd_base_addr(vector_buf_dsd, vector_buf_ptr);
+    @load_to_dsr(vector_buf_dsr, vector_buf_dsd);
+
+    // Reduce phase: converge max toward root
+    if (px == root) {
+        if (!is_last_px) {
+            @fmaxh(vector_buf_dsd, mv_left_recv_max, vector_buf_dsr);
+        }
+        @fmaxh(vector_buf_dsd, mv_right_recv_max, vector_buf_dsr);
+    } else {
+        if (is_first_px) {
+            @fmovh(mv_right_send_max, vector_buf_dsr);
+        } else if (is_last_px) {
+            @fmovh(mv_left_send_max, vector_buf_dsr);
+        } else {
+            if (px < root) {
+                @fmaxh(mv_right_send_max, mv_right_recv_max, vector_buf_dsr);
+            } else { // px > root
+                @fmaxh(mv_left_send_max, mv_left_recv_max, vector_buf_dsr);
+            }
+        }
+    }
+
+    // Broadcast phase: software relay using reverse-direction colors
+    @load_to_dsr(vector_buf_dsr, vector_buf_dsd);
+    if (px == root) {
+        if (!is_first_px) {
+            @fmovh(mv_left_send_max, vector_buf_dsr);
+        }
+        if (!is_last_px) {
+            @fmovh(mv_right_send_max, vector_buf_dsr);
+        }
+    } else if (px < root) {
+        @fmovh(vector_buf_dsd, mv_left_recv_max);
+        if (!is_first_px) {
+            @load_to_dsr(vector_buf_dsr, vector_buf_dsd);
+            @fmovh(mv_left_send_max, vector_buf_dsr);
+        }
+    } else { // px > root
+        @fmovh(vector_buf_dsd, mv_right_recv_max);
+        if (!is_last_px) {
+            @load_to_dsr(vector_buf_dsr, vector_buf_dsd);
+            @fmovh(mv_right_send_max, vector_buf_dsr);
+        }
+    }
+}
+
+fn mv_allreduce_add_x(vector_buf_ptr: [*]f16) void {
+    vector_buf_dsd = @set_dsd_base_addr(vector_buf_dsd, vector_buf_ptr);
+    @load_to_dsr(vector_buf_dsr, vector_buf_dsd);
+
+    // Reduce phase: converge sum toward root
+    if (px == root) {
+        @faddh(vector_buf_dsd, mv_left_recv, vector_buf_dsr);
+        @faddh(vector_buf_dsd, mv_right_recv, vector_buf_dsr);
+    } else {
+        if (is_first_px) {
+            @fmovh(mv_right_send, vector_buf_dsr);
+        } else if (is_last_px) {
+            @fmovh(mv_left_send, vector_buf_dsr);
+        } else {
+            if (px < root) {
+                @faddh(mv_right_send, mv_right_recv, vector_buf_dsr);
+            } else { // px > root
+                @faddh(mv_left_send, mv_left_recv, vector_buf_dsr);
+            }
+        }
+    }
+
+    // Broadcast phase: software relay using reverse-direction colors
+    @load_to_dsr(vector_buf_dsr, vector_buf_dsd);
+    if (px == root) {
+        if (!is_first_px) {
+            @fmovh(mv_left_send, vector_buf_dsr);
+        }
+        if (!is_last_px) {
+            @fmovh(mv_right_send, vector_buf_dsr);
+        }
+    } else if (px < root) {
+        @fmovh(vector_buf_dsd, mv_left_recv);
+        if (!is_first_px) {
+            @load_to_dsr(vector_buf_dsr, vector_buf_dsd);
+            @fmovh(mv_left_send, vector_buf_dsr);
+        }
+    } else { // px > root
+        @fmovh(vector_buf_dsd, mv_right_recv);
+        if (!is_last_px) {
+            @load_to_dsr(vector_buf_dsr, vector_buf_dsd);
+            @fmovh(mv_right_send, vector_buf_dsr);
+        }
+    }
+}
+
+// ===== seqLen_seqLen allreduce DSDs (for matmul_T_reduce) =====
+const mv_right_send_seqLen_seqLen = @get_dsd(fabout_dsd, .{
+    .extent = seq_len_p_pe * seq_len_p_pe,
+    .fabric_color = c_right_send,
+    .output_queue = right_send_queue_id,
+    .simd_mode = .{ .simd_64 = true },
+});
+
+const mv_right_recv_seqLen_seqLen = @get_dsd(fabin_dsd, .{
+    .extent = seq_len_p_pe * seq_len_p_pe,
+    .fabric_color = c_right_recv,
+    .input_queue = right_recv_queue_id,
+    .simd_mode = .{ .simd_64 = true },
+});
+
+const mv_left_send_seqLen_seqLen = @get_dsd(fabout_dsd, .{
+    .extent = seq_len_p_pe * seq_len_p_pe,
+    .fabric_color = c_left_send,
+    .output_queue = left_send_queue_id,
+    .simd_mode = .{ .simd_64 = true },
+});
+
+const mv_left_recv_seqLen_seqLen = @get_dsd(fabin_dsd, .{
+    .extent = seq_len_p_pe * seq_len_p_pe,
+    .fabric_color = c_left_recv,
+    .input_queue = left_recv_queue_id,
+    .simd_mode = .{ .simd_64 = true },
+});
+
+var reduce_send_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe * seq_len_p_pe} -> dummy[i] });
+var reduce_recv_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe * seq_len_p_pe} -> dummy[i] });
+
+const reduce_dest_dsr_1 = @get_dsr(dsr_dest, 1);
+const reduce_src0_dsr_1 = @get_dsr(dsr_src0, 1);
+const reduce_src1_dsr_1 = @get_dsr(dsr_src1, 1);
+
+const reduce_dest_dsr_2 = @get_dsr(dsr_dest, 2);
+const reduce_src0_dsr_2 = @get_dsr(dsr_src0, 2);
+const reduce_src1_dsr_2 = @get_dsr(dsr_src1, 2);
+
+fn matmul_T_reduce_add_x(root_: i16, matrix_send_buf_ptr: [*]f16, matrix_recv_buf_ptr: [*]f16) void {
+
+    reduce_send_dsd = @set_dsd_base_addr(reduce_send_dsd, matrix_send_buf_ptr);
+    @load_to_dsr(reduce_src0_dsr_1, reduce_send_dsd);
+
+    if (px == root_) {
+
+        reduce_recv_dsd = @set_dsd_base_addr(reduce_recv_dsd, matrix_recv_buf_ptr);
+        @load_to_dsr(reduce_dest_dsr_1, reduce_recv_dsd);
+        @load_to_dsr(reduce_dest_dsr_2, reduce_recv_dsd);
+        @load_to_dsr(reduce_src0_dsr_2, reduce_recv_dsd);
+
+        if (is_first_px) {
+            @faddh(reduce_dest_dsr_1, reduce_src0_dsr_1, mv_left_recv_seqLen_seqLen);
+        } else if (is_last_px) {
+            @faddh(reduce_dest_dsr_1, reduce_src0_dsr_1, mv_right_recv_seqLen_seqLen);
+        } else {
+            @faddh(reduce_dest_dsr_1, reduce_src0_dsr_1, mv_left_recv_seqLen_seqLen);
+            @faddh(reduce_dest_dsr_2, reduce_src0_dsr_2, mv_right_recv_seqLen_seqLen);
+        }
+
+    } else {
+
+        @load_to_dsr(reduce_src1_dsr_1, reduce_send_dsd);
+
+        if (is_first_px) {
+            @load_to_dsr(reduce_dest_dsr_1, mv_right_send_seqLen_seqLen);
+            @fmovh(reduce_dest_dsr_1, reduce_src1_dsr_1);
+        } else if (is_last_px) {
+            @load_to_dsr(reduce_dest_dsr_1, mv_left_send_seqLen_seqLen);
+            @fmovh(reduce_dest_dsr_1, reduce_src1_dsr_1);
+        } else {
+
+            if (px < root_) {
+                @load_to_dsr(reduce_dest_dsr_1, mv_right_send_seqLen_seqLen);
+                @faddh(reduce_dest_dsr_1, mv_right_recv_seqLen_seqLen, reduce_src1_dsr_1);
+            } else { // px > root_
+                @load_to_dsr(reduce_dest_dsr_1, mv_left_send_seqLen_seqLen);
+                @faddh(reduce_dest_dsr_1, mv_left_recv_seqLen_seqLen, reduce_src1_dsr_1);
+            }
+
+        }
+
+    }
+
+}
+
+// ===== Two-hop communication DSDs (WSE-3: with queues, simd_64) =====
+const left_matrix_in_dsd_seqLen_dim = @get_dsd(fabin_dsd, .{
+    .fabric_color = x_recv_color, .extent = _seqLen_dim,
+    .input_queue = x_recv_queue_id,
+    .simd_mode = .{ .simd_64 = true }
+});
+const left_matrix_out_dsd_seqLen_dim = @get_dsd(fabout_dsd, .{
+    .fabric_color = x_send_color, .extent = _seqLen_dim,
+    .output_queue = x_send_queue_id,
+    .simd_mode = .{ .simd_64 = true }
+});
+
+const left_matrix_in_dsd_seqLen_seqLen = @get_dsd(fabin_dsd, .{
+    .fabric_color = x_recv_color, .extent = _seqLen_seqLen,
+    .input_queue = x_recv_queue_id,
+    .simd_mode = .{ .simd_64 = true }
+});
+const left_matrix_out_dsd_seqLen_seqLen = @get_dsd(fabout_dsd, .{
+    .fabric_color = x_send_color, .extent = _seqLen_seqLen,
+    .output_queue = x_send_queue_id,
+    .simd_mode = .{ .simd_64 = true }
+});
+
+const left_matrix_in_dsd_seqLen_ffnDim = @get_dsd(fabin_dsd, .{
+    .fabric_color = x_recv_color, .extent = _seqLen_ffnDim,
+    .input_queue = x_recv_queue_id,
+    .simd_mode = .{ .simd_64 = true }
+});
+const left_matrix_out_dsd_seqLen_ffnDim = @get_dsd(fabout_dsd, .{
+    .fabric_color = x_send_color, .extent = _seqLen_ffnDim,
+    .output_queue = x_send_queue_id,
+    .simd_mode = .{ .simd_64 = true }
+});
+
+const right_matrix_in_dsd_dim_dim = @get_dsd(fabin_dsd, .{
+    .fabric_color = y_recv_color, .extent = _dim_dim,
+    .input_queue = y_recv_queue_id,
+    .simd_mode = .{ .simd_64 = true }
+});
+const right_matrix_out_dsd_dim_dim = @get_dsd(fabout_dsd, .{
+    .fabric_color = y_send_color, .extent = _dim_dim,
+    .output_queue = y_send_queue_id,
+    .simd_mode = .{ .simd_64 = true }
+});
+
+const right_matrix_in_dsd_seqLen_dim = @get_dsd(fabin_dsd, .{
+    .fabric_color = y_recv_color, .extent = _seqLen_dim,
+    .input_queue = y_recv_queue_id,
+    .simd_mode = .{ .simd_64 = true }
+});
+const right_matrix_out_dsd_seqLen_dim = @get_dsd(fabout_dsd, .{
+    .fabric_color = y_send_color, .extent = _seqLen_dim,
+    .output_queue = y_send_queue_id,
+    .simd_mode = .{ .simd_64 = true }
+});
+
+const right_matrix_in_dsd_ffnDim_dim = @get_dsd(fabin_dsd, .{
+    .fabric_color = y_recv_color, .extent = _ffnDim_dim,
+    .input_queue = y_recv_queue_id,
+    .simd_mode = .{ .simd_64 = true }
+});
+const right_matrix_out_dsd_ffnDim_dim = @get_dsd(fabout_dsd, .{
+    .fabric_color = y_send_color, .extent = _ffnDim_dim,
+    .output_queue = y_send_queue_id,
+    .simd_mode = .{ .simd_64 = true }
+});
+
+
+const left_matrix_out_dsr = @get_dsr(dsr_dest, 5);
+const left_matrix_in_dsr = @get_dsr(dsr_src1, 5);
+
+const right_matrix_out_dsr = @get_dsr(dsr_dest, 6);
+const right_matrix_in_dsr = @get_dsr(dsr_src1, 6);
+
+fn mm_two_hop_comm(left_matrix_send_buffer_ptr: [*]f16, right_matrix_send_buffer_ptr: [*]f16, left_matrix_recv_buffer_ptr: [*]f16, right_matrix_recv_buffer_ptr: [*]f16, step: i16, Mt: i16, Kt: i16, Nt: i16) void {
+
+    if (step == 0) {
+        var _Mt_Kt = ((Mt * Kt) / 4) * 4;
+        var _Kt_Nt = ((Kt * Nt) / 4) * 4;
+
+        left_matrix_send_dsd = @set_dsd_length(left_matrix_send_dsd, @bitcast(u16, _Mt_Kt));
+        left_matrix_recv_dsd = @set_dsd_length(left_matrix_recv_dsd, @bitcast(u16, _Mt_Kt));
+
+        right_matrix_send_dsd = @set_dsd_length(right_matrix_send_dsd, @bitcast(u16, _Kt_Nt));
+        right_matrix_recv_dsd = @set_dsd_length(right_matrix_recv_dsd, @bitcast(u16, _Kt_Nt));
+
+        if (Kt == dim_p_pe) {
+            @load_to_dsr(left_matrix_in_dsr, left_matrix_in_dsd_seqLen_dim, .{.async=true, .activate=left_matrix_finish_id, .ut_id = ut1});
+            @load_to_dsr(left_matrix_out_dsr, left_matrix_out_dsd_seqLen_dim, .{.async=true, .unblock=left_matrix_finish_id, .ut_id = ut2});
+            if (Nt == dim_p_pe) {
+                @load_to_dsr(right_matrix_in_dsr, right_matrix_in_dsd_dim_dim, .{.async=true, .activate=right_matrix_finish_id, .ut_id = ut3});
+                @load_to_dsr(right_matrix_out_dsr, right_matrix_out_dsd_dim_dim, .{.async=true, .unblock=right_matrix_finish_id, .ut_id = ut4});
+            } else if (Nt == ffn_dim_p_pe) {
+                @load_to_dsr(right_matrix_in_dsr, right_matrix_in_dsd_ffnDim_dim, .{.async=true, .activate=right_matrix_finish_id, .ut_id = ut3});
+                @load_to_dsr(right_matrix_out_dsr, right_matrix_out_dsd_ffnDim_dim, .{.async=true, .unblock=right_matrix_finish_id, .ut_id = ut4});
+            }
+        } else if (Kt == seq_len_p_pe) {
+            @load_to_dsr(left_matrix_in_dsr, left_matrix_in_dsd_seqLen_seqLen, .{.async=true, .activate=left_matrix_finish_id, .ut_id = ut1});
+            @load_to_dsr(left_matrix_out_dsr, left_matrix_out_dsd_seqLen_seqLen, .{.async=true, .unblock=left_matrix_finish_id, .ut_id = ut2});
+            if (Nt == dim_p_pe) {
+                @load_to_dsr(right_matrix_in_dsr, right_matrix_in_dsd_seqLen_dim, .{.async=true, .activate=right_matrix_finish_id, .ut_id = ut3});
+                @load_to_dsr(right_matrix_out_dsr, right_matrix_out_dsd_seqLen_dim, .{.async=true, .unblock=right_matrix_finish_id, .ut_id = ut4});
+            }
+        } else if (Kt == ffn_dim_p_pe) {
+            @load_to_dsr(left_matrix_in_dsr, left_matrix_in_dsd_seqLen_ffnDim, .{.async=true, .activate=left_matrix_finish_id, .ut_id = ut1});
+            @load_to_dsr(left_matrix_out_dsr, left_matrix_out_dsd_seqLen_ffnDim, .{.async=true, .unblock=left_matrix_finish_id, .ut_id = ut2});
+            if (Nt == dim_p_pe) {
+                @load_to_dsr(right_matrix_in_dsr, right_matrix_in_dsd_ffnDim_dim, .{.async=true, .activate=right_matrix_finish_id, .ut_id = ut3});
+                @load_to_dsr(right_matrix_out_dsr, right_matrix_out_dsd_ffnDim_dim, .{.async=true, .unblock=right_matrix_finish_id, .ut_id = ut4});
+            }
+        }
+    }
+
+    mm_two_hop_comm_impl(left_matrix_send_buffer_ptr, right_matrix_send_buffer_ptr, left_matrix_recv_buffer_ptr, right_matrix_recv_buffer_ptr);
+
+}
+
+fn mm_two_hop_comm_impl(left_matrix_send_buffer_ptr: [*]f16, right_matrix_send_buffer_ptr: [*]f16, left_matrix_recv_buffer_ptr: [*]f16, right_matrix_recv_buffer_ptr: [*]f16) void {
+
+    left_matrix_send_dsd = @set_dsd_base_addr(left_matrix_send_dsd, left_matrix_send_buffer_ptr);
+
+    right_matrix_send_dsd = @set_dsd_base_addr(right_matrix_send_dsd, right_matrix_send_buffer_ptr);
+
+    left_matrix_recv_dsd = @set_dsd_base_addr(left_matrix_recv_dsd, left_matrix_recv_buffer_ptr);
+
+    right_matrix_recv_dsd = @set_dsd_base_addr(right_matrix_recv_dsd, right_matrix_recv_buffer_ptr);
+
+    @load_to_dsr(left_send_dsr, left_matrix_send_dsd);
+    @load_to_dsr(left_recv_dsr, left_matrix_recv_dsd);
+    @load_to_dsr(right_send_dsr, right_matrix_send_dsd);
+    @load_to_dsr(right_recv_dsr, right_matrix_recv_dsd);
+
+    @mov16(left_matrix_out_dsr, left_send_dsr, .{.async=true, .unblock=left_matrix_finish_id});
+    @mov16(left_recv_dsr, left_matrix_in_dsr, .{.async=true, .activate=left_matrix_finish_id});
+
+    @mov16(right_matrix_out_dsr, right_send_dsr, .{.async=true, .unblock=right_matrix_finish_id});
+    @mov16(right_recv_dsr, right_matrix_in_dsr, .{.async=true, .activate=right_matrix_finish_id});
+
+}
+
+fn mm_two_hop_comm_T(right_matrix_send_buffer_ptr: [*]f16, right_matrix_recv_buffer_ptr: [*]f16, step: i16) void {
+
+    if (step == 0) {
+        right_matrix_send_dsd = @set_dsd_length(right_matrix_send_dsd, @bitcast(u16, _seqLen_dim));
+        right_matrix_recv_dsd = @set_dsd_length(right_matrix_recv_dsd, @bitcast(u16, _seqLen_dim));
+
+        @load_to_dsr(right_matrix_in_dsr, right_matrix_in_dsd_seqLen_dim, .{.async=true, .activate=right_matrix_finish_id, .ut_id = ut3});
+        @load_to_dsr(right_matrix_out_dsr, right_matrix_out_dsd_seqLen_dim, .{.async=true, .unblock=right_matrix_finish_id, .ut_id = ut4});
+    }
+
+    mm_two_hop_comm_T_impl(right_matrix_send_buffer_ptr, right_matrix_recv_buffer_ptr);
+}
+
+fn mm_two_hop_comm_T_impl(right_matrix_send_buffer_ptr: [*]f16, right_matrix_recv_buffer_ptr: [*]f16) void {
+
+    right_matrix_send_dsd_seqLen_dim = @set_dsd_base_addr(right_matrix_send_dsd_seqLen_dim, right_matrix_send_buffer_ptr);
+    right_matrix_recv_dsd_seqLen_dim = @set_dsd_base_addr(right_matrix_recv_dsd_seqLen_dim, right_matrix_recv_buffer_ptr);
+
+    @load_to_dsr(right_send_dsr, right_matrix_send_dsd_seqLen_dim);
+    @load_to_dsr(right_recv_dsr, right_matrix_recv_dsd_seqLen_dim);
+
+    @mov16(right_matrix_out_dsr, right_send_dsr, .{.async=true, .unblock=right_matrix_finish_id});
+    @mov16(right_recv_dsr, right_matrix_in_dsr, .{.async=true, .activate=right_matrix_finish_id});
+
+}
+
+// ===== Shift DSDs (WSE-3: with queues, simd_64) =====
+const left_matrix_shift_in_dsd_seqLen_dim = @get_dsd(fabin_dsd, .{
+    .fabric_color = x_shift_recv_color, .extent = _seqLen_dim,
+    .input_queue = x_shift_recv_queue_id,
+    .simd_mode = .{ .simd_64 = true }
+});
+const left_matrix_shift_out_dsd_seqLen_dim = @get_dsd(fabout_dsd, .{
+    .fabric_color = x_shift_send_color, .extent = _seqLen_dim,
+    .output_queue = x_shift_send_queue_id,
+    .simd_mode = .{ .simd_64 = true }
+});
+
+const left_matrix_shift_re_in_dsd_seqLen_dim = @get_dsd(fabin_dsd, .{
+    .fabric_color = x_shift_re_recv_color, .extent = _seqLen_dim,
+    .input_queue = x_shift_re_recv_queue_id,
+    .simd_mode = .{ .simd_64 = true }
+});
+const left_matrix_shift_re_out_dsd_seqLen_dim = @get_dsd(fabout_dsd, .{
+    .fabric_color = x_shift_re_send_color, .extent = _seqLen_dim,
+    .output_queue = x_shift_re_send_queue_id,
+    .simd_mode = .{ .simd_64 = true }
+});
+
+const left_matrix_shift_in_dsd_seqLen_seqLen = @get_dsd(fabin_dsd, .{
+    .fabric_color = x_shift_recv_color, .extent = _seqLen_seqLen,
+    .input_queue = x_shift_recv_queue_id,
+    .simd_mode = .{ .simd_64 = true }
+});
+const left_matrix_shift_out_dsd_seqLen_seqLen = @get_dsd(fabout_dsd, .{
+    .fabric_color = x_shift_send_color, .extent = _seqLen_seqLen,
+    .output_queue = x_shift_send_queue_id,
+    .simd_mode = .{ .simd_64 = true }
+});
+
+const left_matrix_shift_re_in_dsd_seqLen_seqLen = @get_dsd(fabin_dsd, .{
+    .fabric_color = x_shift_re_recv_color, .extent = _seqLen_seqLen,
+    .input_queue = x_shift_re_recv_queue_id,
+    .simd_mode = .{ .simd_64 = true }
+});
+const left_matrix_shift_re_out_dsd_seqLen_seqLen = @get_dsd(fabout_dsd, .{
+    .fabric_color = x_shift_re_send_color, .extent = _seqLen_seqLen,
+    .output_queue = x_shift_re_send_queue_id,
+    .simd_mode = .{ .simd_64 = true }
+});
+
+const left_matrix_shift_in_dsd_seqLen_ffnDim = @get_dsd(fabin_dsd, .{
+    .fabric_color = x_shift_recv_color, .extent = _seqLen_ffnDim,
+    .input_queue = x_shift_recv_queue_id,
+    .simd_mode = .{ .simd_64 = true }
+});
+const left_matrix_shift_out_dsd_seqLen_ffnDim = @get_dsd(fabout_dsd, .{
+    .fabric_color = x_shift_send_color, .extent = _seqLen_ffnDim,
+    .output_queue = x_shift_send_queue_id,
+    .simd_mode = .{ .simd_64 = true }
+});
+
+const left_matrix_shift_re_in_dsd_seqLen_ffnDim = @get_dsd(fabin_dsd, .{
+    .fabric_color = x_shift_re_recv_color, .extent = _seqLen_ffnDim,
+    .input_queue = x_shift_re_recv_queue_id,
+    .simd_mode = .{ .simd_64 = true }
+});
+const left_matrix_shift_re_out_dsd_seqLen_ffnDim = @get_dsd(fabout_dsd, .{
+    .fabric_color = x_shift_re_send_color, .extent = _seqLen_ffnDim,
+    .output_queue = x_shift_re_send_queue_id,
+    .simd_mode = .{ .simd_64 = true }
+});
+
+const left_matrix_shift_out_dsr = @get_dsr(dsr_dest, 7);
+const left_matrix_shift_in_dsr = @get_dsr(dsr_src1, 7);
+
+fn left_matrix_shift(left_matrix_send_buffer_ptr: [*]f16, left_matrix_recv_buffer_ptr: [*]f16, dim_length: i16, step: i16) void {
+    if (step == 0) {
+        var _dim_length: i16 = (dim_length / 4) * 4;
+        left_matrix_send_dsd = @set_dsd_length(left_matrix_send_dsd, @bitcast(u16, _dim_length));
+        left_matrix_recv_dsd = @set_dsd_length(left_matrix_recv_dsd, @bitcast(u16, _dim_length));
+
+        if (_dim_length == _seqLen_dim) {
+            if (shift_reverse) {
+                @load_to_dsr(left_matrix_shift_out_dsr, left_matrix_shift_re_out_dsd_seqLen_dim, .{.async=true, .unblock=left_matrix_shift_finish_id, .ut_id = ut1});
+                @load_to_dsr(left_matrix_shift_in_dsr, left_matrix_shift_re_in_dsd_seqLen_dim, .{.async=true, .activate=left_matrix_shift_finish_id, .ut_id = ut2});
+            } else {
+                @load_to_dsr(left_matrix_shift_out_dsr, left_matrix_shift_out_dsd_seqLen_dim, .{.async=true, .unblock=left_matrix_shift_finish_id, .ut_id = ut1});
+                @load_to_dsr(left_matrix_shift_in_dsr, left_matrix_shift_in_dsd_seqLen_dim, .{.async=true, .activate=left_matrix_shift_finish_id, .ut_id = ut2});
+            }
+        } else if (_dim_length == _seqLen_seqLen) {
+            if (shift_reverse) {
+                @load_to_dsr(left_matrix_shift_out_dsr, left_matrix_shift_re_out_dsd_seqLen_seqLen, .{.async=true, .unblock=left_matrix_shift_finish_id, .ut_id = ut1});
+                @load_to_dsr(left_matrix_shift_in_dsr, left_matrix_shift_re_in_dsd_seqLen_seqLen, .{.async=true, .activate=left_matrix_shift_finish_id, .ut_id = ut2});
+            } else {
+                @load_to_dsr(left_matrix_shift_out_dsr, left_matrix_shift_out_dsd_seqLen_seqLen, .{.async=true, .unblock=left_matrix_shift_finish_id, .ut_id = ut1});
+                @load_to_dsr(left_matrix_shift_in_dsr, left_matrix_shift_in_dsd_seqLen_seqLen, .{.async=true, .activate=left_matrix_shift_finish_id, .ut_id = ut2});
+            }
+        } else if (_dim_length == _seqLen_ffnDim) {
+            if (shift_reverse) {
+                @load_to_dsr(left_matrix_shift_out_dsr, left_matrix_shift_re_out_dsd_seqLen_ffnDim, .{.async=true, .unblock=left_matrix_shift_finish_id, .ut_id = ut1});
+                @load_to_dsr(left_matrix_shift_in_dsr, left_matrix_shift_re_in_dsd_seqLen_ffnDim, .{.async=true, .activate=left_matrix_shift_finish_id, .ut_id = ut2});
+            } else {
+                @load_to_dsr(left_matrix_shift_out_dsr, left_matrix_shift_out_dsd_seqLen_ffnDim, .{.async=true, .unblock=left_matrix_shift_finish_id, .ut_id = ut1});
+                @load_to_dsr(left_matrix_shift_in_dsr, left_matrix_shift_in_dsd_seqLen_ffnDim, .{.async=true, .activate=left_matrix_shift_finish_id, .ut_id = ut2});
+            }
+        }
+    }
+
+    left_matrix_shift_impl(left_matrix_send_buffer_ptr, left_matrix_recv_buffer_ptr);
+}
+
+fn left_matrix_shift_impl(left_matrix_send_buffer_ptr: [*]f16, left_matrix_recv_buffer_ptr: [*]f16) void {
+
+    left_matrix_send_dsd = @set_dsd_base_addr(left_matrix_send_dsd, left_matrix_send_buffer_ptr);
+    left_matrix_recv_dsd = @set_dsd_base_addr(left_matrix_recv_dsd, left_matrix_recv_buffer_ptr);
+
+    @load_to_dsr(left_send_dsr, left_matrix_send_dsd);
+    @load_to_dsr(left_recv_dsr, left_matrix_recv_dsd);
+
+    @mov16(left_matrix_shift_out_dsr, left_send_dsr, .{.async=true, .unblock=left_matrix_shift_finish_id});
+    @mov16(left_recv_dsr, left_matrix_shift_in_dsr, .{.async=true, .activate=left_matrix_shift_finish_id});
+
+}
+
+// ===== Queue initialization (WSE-3 mandatory) =====
+comptime {
+    // Allreduce queues
+    @initialize_queue(right_recv_queue_id, .{.color = c_right_recv});
+    @initialize_queue(right_send_queue_id, .{.color = c_right_send});
+    @initialize_queue(left_recv_queue_id, .{.color = c_left_recv});
+    @initialize_queue(left_send_queue_id, .{.color = c_left_send});
+
+    // Two-hop queues
+    @initialize_queue(x_recv_queue_id, .{.color = x_recv_color});
+    @initialize_queue(x_send_queue_id, .{.color = x_send_color});
+    @initialize_queue(y_recv_queue_id, .{.color = y_recv_color});
+    @initialize_queue(y_send_queue_id, .{.color = y_send_color});
+    @initialize_queue(x_shift_recv_queue_id, .{.color = x_shift_recv_color});
+    @initialize_queue(x_shift_send_queue_id, .{.color = x_shift_send_color});
+    @initialize_queue(x_shift_re_recv_queue_id, .{.color = x_shift_re_recv_color});
+    @initialize_queue(x_shift_re_send_queue_id, .{.color = x_shift_re_send_color});
+}
+
+// ===== Block queues (WSE-3: block queue IDs, not colors) =====
+comptime {
+    // Allreduce
+    @block(right_recv_queue_id);
+    @block(left_recv_queue_id);
+
+    // Two-hop
+    @block(x_recv_queue_id);
+    @block(y_recv_queue_id);
+    @block(x_shift_recv_queue_id);
+    @block(x_shift_re_recv_queue_id);
+
+    @bind_local_task(left_matrix_shift_finish, left_matrix_shift_finish_id);
+    @block(left_matrix_shift_finish_id);
+}
