@@ -111,5 +111,6 @@ layout {
     @export_name("timer_buf", [*]f32, true);
     @export_name("time_ref", [*]f32, true);
     @export_name("prof_timer_buf", [*]f32, true);
+    @export_name("iter_timer", [*]f32, true);
     @export_name("debug", [*]f16, true);
 }
