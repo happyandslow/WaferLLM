@@ -250,7 +250,7 @@ def main():
     
     repeat_steps = 1
     warmup_steps = 0
-    runner.launch("decode_host", np.int16(repeat_steps), np.int16(warmup_steps), nonblock=False)
+    runner.launch("decode_host", np.int16(warmup_steps), np.int16(repeat_steps), nonblock=False)
     
     # -------------------------------------------------------------------------- #
     # ------------------------------ D2H memcpy ------------------------------ #

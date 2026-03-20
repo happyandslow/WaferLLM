@@ -652,7 +652,7 @@ def main():
     runner.launch("init_task", nonblock=False)
 
     warmup_steps  = 0
-    runner.launch("decode_host", np.int16(repeat_steps), np.int16(warmup_steps),
+    runner.launch("decode_host", np.int16(warmup_steps), np.int16(repeat_steps),
                   nonblock=False)
 
     # ------------------------------------------------------------------ #
