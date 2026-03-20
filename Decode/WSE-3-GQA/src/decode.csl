@@ -137,6 +137,14 @@ var prof_tsc_12 = @zeros([timestamp.tsc_size_words]u16);
 var prof_timer_buf = @zeros([36]f32); // 12 phases × 3 f32 each
 var ptr_prof_timer_buf: [*]f32 = &prof_timer_buf;
 
+// Per-iteration timestamps: record TSC at start of each timed iteration
+const MAX_ITERS: i16 = 64;
+var iter_tsc_buf = @zeros([MAX_ITERS * timestamp.tsc_size_words]u16);
+// Packed for D2H: 2 f32 per timestamp (low 32 bits + high 16 bits)
+var iter_timer_f32 = @zeros([MAX_ITERS * 2]f32);
+var ptr_iter_timer_f32: [*]f32 = &iter_timer_f32;
+var num_timed_iters: i16 = 0;  // actual count of timed iterations recorded
+
 // -------------------------------------------------------------------------- //
 // --------------------------------- Utils ---------------------------------- //
 // -------------------------------------------------------------------------- //
@@ -1761,6 +1769,7 @@ fn exit() void {
     f_reference_timestamps();
     f_memcpy_timestamps();
     f_pack_prof_timestamps();
+    f_pack_iter_timestamps();
     sys_mod.unblock_cmd_stream();
 }
 
@@ -1788,6 +1797,16 @@ fn decode_entry() void {
         if (repeat_times == total_warmup_times) {
             timestamp.get_timestamp(&tsc_ref_buf);
             timestamp.get_timestamp(&tsc_start_buf);
+        }
+
+        // Record per-iteration boundary timestamp for timed iterations
+        if (repeat_times >= total_warmup_times) {
+            var iter_idx: i16 = repeat_times - total_warmup_times;
+            if (iter_idx < MAX_ITERS) {
+                var offset: i16 = iter_idx * timestamp.tsc_size_words;
+                timestamp.get_timestamp(@ptrcast(*[timestamp.tsc_size_words]u16, &iter_tsc_buf[@bitcast(u16, offset)]));
+                num_timed_iters = iter_idx + 1;
+            }
         }
 
         repeat_times += 1;
@@ -1919,6 +1938,21 @@ fn f_pack_prof_timestamps() void {
     prof_timer_buf[35] = @bitcast(f32, (@as(u32,hi_p) << @as(u16,16)) | @as(u32, lo_p));
 }
 
+fn f_pack_iter_timestamps() void {
+    var lo_i: u16 = 0;
+    var hi_i: u16 = 0;
+    for (@range(i16, MAX_ITERS)) |i| {
+        var base_src: u16 = @bitcast(u16, i) * timestamp.tsc_size_words;
+        var base_dst: u16 = @bitcast(u16, i) * 2;
+        lo_i = iter_tsc_buf[base_src];
+        hi_i = iter_tsc_buf[base_src + 1];
+        iter_timer_f32[base_dst] = @bitcast(f32, (@as(u32, hi_i) << @as(u16, 16)) | @as(u32, lo_i));
+        lo_i = iter_tsc_buf[base_src + 2];
+        hi_i = 0;
+        iter_timer_f32[base_dst + 1] = @bitcast(f32, (@as(u32, hi_i) << @as(u16, 16)) | @as(u32, lo_i));
+    }
+}
+
 fn f_reference_timestamps() void {
     var lo_ : u16 = 0;
     var hi_ : u16 = 0;
@@ -1969,6 +2003,7 @@ comptime {
     @export_symbol(ptr_timer_buf, "timer_buf");
     @export_symbol(ptr_time_ref, "time_ref");
     @export_symbol(ptr_prof_timer_buf, "prof_timer_buf");
+    @export_symbol(ptr_iter_timer_f32, "iter_timer");
     @export_symbol(ptr_debug, "debug");
 }
 

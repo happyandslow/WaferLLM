@@ -128,6 +128,7 @@ def main():
     symbol_timer_buf = runner.get_id("timer_buf")
     symbol_timer_ref = runner.get_id("time_ref")
     sym_prof_timer = runner.get_id("prof_timer_buf")
+    sym_iter_timer = runner.get_id("iter_timer")
     sym_debug = runner.get_id("debug")
     
     
@@ -271,8 +272,19 @@ def main():
     )
     prof_hwl = prof_buf_1d.view(np.float32).reshape((P, P, NUM_PROF_FNS * 3))
 
+    # D2H: per-iteration boundary timestamps
+    MAX_ITERS = 64
+    n_iter_f32 = MAX_ITERS * 2
+    iter_buf_1d = np.zeros(P * P * n_iter_f32, dtype=np.uint32)
+    runner.memcpy_d2h(
+        iter_buf_1d, sym_iter_timer, 0, 0, P, P, n_iter_f32,
+        streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
+        order=MemcpyOrder.ROW_MAJOR, nonblock=False
+    )
+    iter_hwl = iter_buf_1d.view(np.uint32).reshape((P, P, n_iter_f32))
+
     runner.stop()
-    
+
     # -------------------------------------------------------------------------- #
     # ------------------------------ Debug Check ------------------------------ #
     # -------------------------------------------------------------------------- #
@@ -354,10 +366,79 @@ def main():
     print(f"\n--- Sum of all phases (last iteration only) ---")
     print(f"  mean   = {ps.mean():.0f}")
     print(f"  std    = {ps.std():.0f}")
-    print(f"\n--- Overall for comparison ({repeat_steps} iters, per-iter) ---")
+    print(f"  min    = {ps.min():.0f}")
+    print(f"  max    = {ps.max():.0f}")
+
+    # Overall: raw total and per-iteration with full distribution
+    c_total = cycles_count.flatten()  # raw total cycles (not divided by repeat_steps)
+    print(f"\n--- Overall total cycles across {P}x{P} PEs ({repeat_steps} iters, warmup={warmup_steps}) ---")
+    print(f"  mean   = {c_total.mean():.0f}")
+    print(f"  median = {np.median(c_total):.0f}")
+    print(f"  std    = {c_total.std():.0f}")
+    print(f"  min    = {c_total.min():.0f}")
+    print(f"  max    = {c_total.max():.0f}")
+    print(f"  p1     = {np.percentile(c_total, 1):.0f}")
+    print(f"  p5     = {np.percentile(c_total, 5):.0f}")
+    print(f"  p10    = {np.percentile(c_total, 10):.0f}")
+    print(f"  p25    = {np.percentile(c_total, 25):.0f}")
+    print(f"  p75    = {np.percentile(c_total, 75):.0f}")
+    print(f"  p90    = {np.percentile(c_total, 90):.0f}")
+    print(f"  p95    = {np.percentile(c_total, 95):.0f}")
+    print(f"  p99    = {np.percentile(c_total, 99):.0f}")
+
+    print(f"\n--- Per-iteration average (total / {repeat_steps}) ---")
     print(f"  mean   = {c.mean():.0f}")
-    print(f"  std    = {c.std():.0f}")
-    print(f"\n  Phase sum / Overall-per-iter = {ps.mean() / c.mean():.4f}")
+    print(f"  min    = {c.min():.0f}")
+    print(f"  max    = {c.max():.0f}")
+
+    # Ratio analysis
+    expected_total = ps.mean() * repeat_steps
+    print(f"\n--- Ratio analysis ---")
+    print(f"  Phase sum (last iter)              = {ps.mean():.0f}")
+    print(f"  Expected total ({repeat_steps} × phase sum) = {expected_total:.0f}")
+    print(f"  Actual total (mean)                = {c_total.mean():.0f}")
+    print(f"  Actual total (min PE)              = {c_total.min():.0f}")
+    print(f"  Overhead ratio (mean total / expected) = {c_total.mean() / expected_total:.4f}")
+    print(f"  Overhead ratio (min total / expected)  = {c_total.min() / expected_total:.4f}")
+
+    # Per-PE residual: how much extra time beyond compute
+    residual = c_total - expected_total
+    print(f"\n--- Per-PE overhead beyond {repeat_steps} × phase_sum ---")
+    print(f"  mean   = {residual.mean():.0f} cycles ({residual.mean()/c_total.mean()*100:.1f}%)")
+    print(f"  min    = {residual.min():.0f} cycles")
+    print(f"  max    = {residual.max():.0f} cycles")
+    print(f"  std    = {residual.std():.0f} cycles")
+
+    # ─── Per-iteration cycle progression ─────────────────────────────────────
+    def reconstruct_u48(u32_pair):
+        lo32 = int(u32_pair[0])
+        hi16 = int(u32_pair[1]) & 0xFFFF
+        return lo32 + (hi16 << 32)
+
+    def reconstruct_tsc_end(timer_3f32):
+        w1 = int(np.frombuffer(np.float32(timer_3f32[1]).tobytes(), dtype=np.uint32)[0])
+        w2 = int(np.frombuffer(np.float32(timer_3f32[2]).tobytes(), dtype=np.uint32)[0])
+        end_lo = (w1 >> 16) & 0xFFFF
+        end_mid = w2 & 0xFFFF
+        end_hi = (w2 >> 16) & 0xFFFF
+        return end_lo + (end_mid << 16) + (end_hi << 32)
+
+    n_iters_to_show = min(repeat_steps, MAX_ITERS)
+    iter_cycles = np.zeros((P, P, n_iters_to_show), dtype=np.float64)
+    for pe_y in range(P):
+        for pe_x in range(P):
+            boundaries = []
+            for i in range(n_iters_to_show):
+                boundaries.append(reconstruct_u48(iter_hwl[pe_y, pe_x, i*2:(i+1)*2]))
+            boundaries.append(reconstruct_tsc_end(timer_buf_time_hwl[pe_y, pe_x, :]))
+            for i in range(n_iters_to_show):
+                iter_cycles[pe_y, pe_x, i] = boundaries[i+1] - boundaries[i]
+
+    print(f"\n--- Per-iteration cycle progression ({n_iters_to_show} iterations) ---")
+    print(f"  {'iter':>4s}  {'mean':>8s}  {'std':>8s}  {'min':>8s}  {'p5':>8s}  {'p25':>8s}  {'median':>8s}  {'p75':>8s}  {'p95':>8s}  {'max':>8s}")
+    for i in range(n_iters_to_show):
+        ic = iter_cycles[:, :, i].flatten()
+        print(f"  {i:4d}  {ic.mean():8.0f}  {ic.std():8.0f}  {ic.min():8.0f}  {np.percentile(ic,5):8.0f}  {np.percentile(ic,25):8.0f}  {np.median(ic):8.0f}  {np.percentile(ic,75):8.0f}  {np.percentile(ic,95):8.0f}  {ic.max():8.0f}")
 
 if __name__ == "__main__":
     main()
