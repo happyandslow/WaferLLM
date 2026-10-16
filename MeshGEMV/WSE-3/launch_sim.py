@@ -39,11 +39,15 @@ def main():
     io_dtype = MemcpyDataType.MEMCPY_16BIT
     memcpy_order = MemcpyOrder.ROW_MAJOR
     
-    X = np.random.rand(1, M).astype(np.float16)
+    #X = np.random.rand(1, M).astype(np.float16)
+    X = np.ones((1, M), dtype=np.float16)
     tensor_X = np.tile(X.reshape(P, Mt), reps=(1, P))
+    print("tensor_X:")
+    print(tensor_X)
     
     tensor_W = np.random.rand(M, N).astype(np.float16)
-    
+    print("tensor_W:")
+    print(tensor_W)
     runner = SdkRuntime("out")
     runner.load()
     runner.run()
