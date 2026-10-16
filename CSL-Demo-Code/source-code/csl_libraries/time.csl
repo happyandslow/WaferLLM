@@ -1,0 +1,24 @@
+
+const ts = @import_module("<time/internal>");
+
+const tsc_size_words = ts.tsc_size_words;
+
+fn enable_tsc() void {
+  ts.enable_tsc();
+}
+
+fn disable_tsc() void {
+  ts.disable_tsc();
+}
+
+fn get_timestamp(result : *[3]u16) void {
+  ts.get_timestamp(result);
+}
+
+fn reset_tsc_counter() void {
+  ts.reset_tsc_counter();
+}
+
+fn get_perf_cntr(result : *[3]u16, cntr_id: i16) void {
+  ts.get_perf_cntr(result, cntr_id);
+}

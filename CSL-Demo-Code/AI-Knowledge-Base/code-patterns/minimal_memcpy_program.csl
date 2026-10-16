@@ -1,0 +1,36 @@
+// CSL Code Pattern: Minimal Memcpy Program
+// A complete minimal CSL program with host-device communication.
+// SDK Version: 1.4.0 | Works on WSE-2 and WSE-3
+
+// === pe_program.csl ===
+param memcpy_params: comptime_struct;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+
+// Device-side data
+var data = @zeros([10]f32);
+var ptr_data: [*]f32 = &data;
+
+// Kernel function: add 1.0 to every element
+fn compute() void {
+    const data_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{10} -> data[i] });
+    const one = [1]f32{1.0};
+    const one_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{10} -> one[0] });
+    @fadds(data_dsd, data_dsd, one_dsd);
+    sys_mod.unblock_cmd_stream();  // Signal host: done
+}
+
+comptime {
+    @export_symbol(ptr_data, "data");
+    @export_symbol(compute);
+}
+
+// === Host-side usage (run.py) ===
+// from cerebras.sdk.runtime.sdkruntimepybind import SdkRuntime
+// runner = SdkRuntime("out", cmaddr=args.cmaddr)
+// runner.load()
+// runner.run()
+// runner.memcpy_h2d(data_symbol, input_data, ...)
+// runner.launch("compute", nonblock=False)
+// runner.memcpy_d2h(output_data, data_symbol, ...)
+// runner.stop()

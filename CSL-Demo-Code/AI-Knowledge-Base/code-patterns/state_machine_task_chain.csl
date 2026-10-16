@@ -1,0 +1,81 @@
+// CSL Code Pattern: State Machine Task Chain
+// Multi-phase algorithm using cur_state/next_state + @activate pattern.
+// SDK Version: 1.4.0 | Works on WSE-2 and WSE-3
+
+param memcpy_params: comptime_struct;
+param STATE: local_task_id;  // The dispatcher task ID
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+
+// --- State definitions ---
+const STATE_INIT: i16 = 0;
+const STATE_COMPUTE: i16 = 1;
+const STATE_REDUCE: i16 = 2;
+const STATE_CHECK: i16 = 3;
+const STATE_EXIT: i16 = 4;
+
+var cur_state: i16 = 0;
+var next_state: i16 = 0;
+var iteration: i16 = 0;
+
+// --- Callback for async modules ---
+// Async libraries call this when they complete, advancing to next_state.
+fn f_trigger_state_machine() void {
+    cur_state = next_state;
+    @activate(STATE);
+}
+
+// --- Phase functions ---
+fn f_init() void {
+    // Setup DSDs, lengths, etc.
+    f_trigger_state_machine();  // Sync function: trigger manually
+}
+
+fn f_compute() void {
+    // Start async computation (e.g., stencil, SpMV)
+    // When the async module finishes, it calls f_trigger_state_machine
+}
+
+fn f_reduce() void {
+    // Start async allreduce
+    // Module calls f_trigger_state_machine on completion
+}
+
+// --- The dispatcher task ---
+task f_state() void {
+    if (STATE_INIT == cur_state) {
+        next_state = STATE_COMPUTE;  // ALWAYS set next_state BEFORE calling async fn
+        f_init();
+
+    } else if (STATE_COMPUTE == cur_state) {
+        next_state = STATE_REDUCE;
+        f_compute();
+
+    } else if (STATE_REDUCE == cur_state) {
+        next_state = STATE_CHECK;
+        f_reduce();
+
+    } else if (STATE_CHECK == cur_state) {
+        iteration += 1;
+        if (iteration < 100) {
+            next_state = STATE_COMPUTE;  // Loop back
+        } else {
+            next_state = STATE_EXIT;     // Done
+        }
+        f_trigger_state_machine();
+
+    } else if (STATE_EXIT == cur_state) {
+        sys_mod.unblock_cmd_stream();    // Return control to host
+    }
+}
+
+// --- Entry point (called from host via runner.launch) ---
+fn f_start() void {
+    cur_state = STATE_INIT;
+    @activate(STATE);
+}
+
+comptime {
+    @bind_local_task(f_state, STATE);
+    @export_symbol(f_start);
+}

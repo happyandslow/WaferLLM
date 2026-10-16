@@ -1,0 +1,28 @@
+param target : imported_module;
+
+const common =
+    @import_module("<tile_config/filters/common>", .{.target = target});
+
+const reg_type = target.reg_type;
+const field = target.field;
+
+// Filter configuration functions.
+//////////////////////////////////
+
+// Set the active limit of a counter filter identified by `filter_id`
+// to `limit`.
+fn set_active_limit(filter_id: u16, limit: reg_type) void {
+  common.set_config(filter_id, field.ACTIVE_LIMIT, limit);
+}
+
+// Set the maximum counter value of a counter filter identified by `filter_id`
+// to `max_counter`.
+fn set_max_counter(filter_id: u16, max_counter: reg_type) void {
+  common.set_config(filter_id, field.MAX_COUNTER, max_counter);
+}
+
+// Set the counter value of a counter filter identified by `filter_id`
+// to `counter`.
+fn set_counter(filter_id: u16, counter: reg_type) void {
+  common.set_config(filter_id, field.COUNTER, counter);
+}

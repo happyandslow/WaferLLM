@@ -1,0 +1,307 @@
+// Tile map for WSE3 (Schrödinger) architecture.
+const common = @import_module("<target/common>");
+
+const word_size = common.word_size;
+const reg_type = common.reg;
+const double_reg_type = common.double_reg;
+
+const addresses = enum(reg_type) {
+  TASK_PRIORITY        = 0x7e08 * word_size,
+  CONTROL_TRANSFORM    = 0x7e0a * word_size,
+  MISC_CFG             = 0x7e1f * word_size,
+  EXCEPTION_MASK_ADDR  = 0x7e12 * word_size,
+  PERF_CNTR0           = 0x7b20 * word_size,
+  PERF_CNTR1           = 0x7b24 * word_size,
+  TIMESTAMP_COUNTER    = 0x7b30 * word_size,
+  PERF_COUNTER_CONTROL = 0x7b34 * word_size,
+  INPUT_QUEUE_CONFIG   = 0x7bc0 * word_size,
+  OUTPUT_QUEUE_CONFIG  = 0x7b80 * word_size,
+  COLOR_CONFIG         = 0x7c00 * word_size,
+  TEARDOWN_PENDING     = 0x7c42 * word_size,
+  MISC_FABRIC_CFG      = 0x7c44 * word_size,
+  FABRIC_COORD         = 0x7c45 * word_size,
+  SWITCH_CONFIG        = 0x7c80 * word_size,
+  PRNG_STATE           = 0x7dd0 * word_size,
+  FILTER               = 0x7b40 * word_size,
+  IQFLUSH_STATUS       = 0x7be1 * word_size,
+  OQFLUSH_STATUS       = 0x7b92 * word_size,
+  INPUT_QUEUE_STATUS   = 0x7be0 * word_size,
+  OUTPUT_QUEUE_STATUS  = 0x7b90 * word_size
+};
+
+const fabric_coord_mask = 0x07ff;
+const fabric_coord = enum(reg_type) {
+  X = word_size,
+  Y = 0
+};
+
+const filter_bank_1_size = 6;
+const num_filters = filter_bank_1_size;
+const filter_size = 8 * word_size;
+const filter_cfg_size = 2 * word_size;
+const field = enum(reg_type) {
+  CONFIG0 = 0 * word_size,
+  CONFIG1 = 1 * word_size,
+  DROP_COUNT = 2 * word_size,
+  DROP_COUNT_HI = 3 * word_size,
+  MAX_PASS = 4 * word_size,
+  MAX_PASS_HI = 5 * word_size,
+  COUNTER = 6 * word_size,
+  STATE = 7 * word_size
+};
+
+const prng_count = common.prng_count;
+const prng_size = common.prng_size;
+
+const tsc_size_words = common.tsc_size_words;
+
+const main_thread_priority_offset = common.main_thread_priority_offset;
+const main_thread_priority_mask: reg_type = 0b11 << main_thread_priority_offset;
+const main_thread_priority_level = common.main_thread_priority_level;
+
+const teardown_in_progress_offset: reg_type = 15;
+
+// Routing
+
+const fabric_io = enum(reg_type) {
+  TX_WEST = 0x1,
+  TX_EAST = 0x2,
+  TX_SOUTH = 0x4,
+  TX_NORTH = 0x8,
+  TX_RAMP = 0x10,
+
+  RX_WEST = 0x0,
+  RX_EAST = 0x20,
+  RX_SOUTH = 0x40,
+  RX_NORTH = 0x60,
+  RX_RAMP = 0x80,
+  RX_DISABLE = 0xa0,
+  RX_MASK = 0xe0,
+
+  CLEAR_MASK = 0xff00
+};
+
+fn is_input_direction(comptime dir: fabric_io) bool {
+  return dir == fabric_io.RX_WEST or
+         dir == fabric_io.RX_EAST or
+         dir == fabric_io.RX_SOUTH or
+         dir == fabric_io.RX_NORTH or
+         dir == fabric_io.RX_RAMP;
+}
+
+// Switching
+
+const SWITCH_REGS_PER_COLOR = 4;
+
+const pop_mode = enum(reg_type) {
+  NO_POP = 0x0,
+  ALWAYS_POP = 0x2000,
+  POP_ON_ADVANCE = 0x4000,
+  POP_ON_ADVANCE_OR_NOP = 0x6000,
+
+  CLEAR_MASK = 0x9fff
+};
+
+const ring_mode = enum(reg_type) {
+  NO_RING_MODE = 0x0,
+  RING_MODE = 0x1000,
+
+  CLEAR_MASK = 0xefff
+};
+
+const switch_status = enum(reg_type) {
+  CLEAR_CURRENT_POS = 0xfff0,
+  // pos1 has 8 bits:
+  // bits 7:5 pos1 input select
+  // bits 4:0 pos1 output <dir> enable
+  SELECT_INPUT_POS0_1_2 = 0x00e0,
+  SELECT_OUTPUT_POS0_1_2 = 0x001f
+};
+
+const switch_select = common.switch_select;
+
+// WARNING: "comptime" is necessary, otherwise the compilation error is
+//   function parameter type is not valid at runtime: 'type'.
+// WARNING: if-else is necessary otherwise the compilation error shows
+//   @comptime_assert is unreachable.
+fn get_switch_setting_word_offset(comptime setting_type: type) u16 {
+  if (@is_same_type(setting_type, pop_mode)){
+    return 0;
+  }else if (@is_same_type(setting_type, ring_mode)){
+    return 0;
+  }else{
+    @comptime_assert(@is_same_type(setting_type, switch_status));
+    return 3;
+  }
+}
+
+// SDR has four switch config registers, 0x7c80 - 0x7cdf
+// switch reg 0: 0x7c80
+// switch reg 1: 0x7c81
+// switch reg 2: 0x7c82
+// fabric color status reg: 0x7c83
+//
+// switch reg 0 contains pos1 (bits 7:0)
+// switch reg 1 contains pos2 (bits 7:0) and pos3 (bits 15:8)
+// fabric color status reg contains current switch position,
+//    input switch position at 3:2 and
+//    output switch position at 1:0
+
+// Indices of the 3 switch positions within the mask
+// bits 7:5 of reg0 is the pos1 input select
+const INPUT_POS1: u16 = get_switch_pos_input_reg_offset(switch_pos.POS1);
+// bits 7:5 of reg1 is the pos2 input select
+const INPUT_POS2: u16 = get_switch_pos_input_reg_offset(switch_pos.POS2);
+// bits 15:13 of reg1 is the pos3 input select
+const INPUT_POS3: u16 = get_switch_pos_input_reg_offset(switch_pos.POS3);
+
+// Index of the bit that contains the current switch position
+// bits 3:2 input switch position
+// bits 1:0 output switch position
+const OUTPUT_SWITCH_CUR_POS: u16 = 0;
+const INPUT_SWITCH_CUR_POS: u16 = 2;
+
+const NUM_COLORS = common.NUM_COLORS;
+const REGS_PER_COLOR = common.REGS_PER_COLOR;
+const get_addr_range_specifier = common.get_addr_range_specifier;
+
+const base_addr_switch_config = @get_int(addresses.SWITCH_CONFIG) / word_size;
+const switch_addr_range = get_addr_range_specifier(
+    base_addr_switch_config, NUM_COLORS, SWITCH_REGS_PER_COLOR);
+
+const base_addr_color_config = @get_int(addresses.COLOR_CONFIG) / word_size;
+const color_addr_range = get_addr_range_specifier(
+    base_addr_color_config, NUM_COLORS, REGS_PER_COLOR);
+
+// SDR has four switch registers.
+// reg 0 contains position 1.
+// reg 1 contains position 2.
+// To invalidate pos1, pos2 and pos3, we need to touch
+// two registers, so we have to put this function under
+// target/<arch>.
+fn set_invalid_for_all_switch_positions(addr_reg0: reg_type) void {
+
+  const addr_reg1 = addr_reg0 + 1;
+
+  // clear pos1 in reg0
+  var r_switch_state = @get_config(addr_reg0, switch_addr_range);
+  r_switch_state &= 0xff00;
+  r_switch_state = r_switch_state | (common.SWITCH_INVALID << INPUT_POS1);
+  @set_config(addr_reg0, r_switch_state, switch_addr_range);
+
+  // clear pos2 and pos3 in reg1
+  r_switch_state = (common.SWITCH_INVALID << INPUT_POS2) |
+                   (common.SWITCH_INVALID << INPUT_POS3);
+  @set_config(addr_reg1, r_switch_state, switch_addr_range);
+}
+
+const switch_direction_encoding = common.switch_direction_encoding;
+
+const switch_pos = enum(u16) {
+  POS1,
+  POS2,
+  POS3
+};
+
+fn get_switch_pos_reg(pos: switch_pos) reg_type {
+  return @get_int(switch (pos) {
+    switch_pos.POS1 => field.CONFIG0,
+    switch_pos.POS2, switch_pos.POS3 => field.CONFIG1,
+  });
+}
+
+fn get_switch_pos_reg_offset(pos: switch_pos) u16 {
+  return switch (pos) {
+    switch_pos.POS1, switch_pos.POS2 => 0,
+    switch_pos.POS3 => 8,
+  };
+}
+
+fn get_clear_switch_pos_mask(pos: switch_pos) u16 {
+  return ~(@as(u16, 0xff) << get_switch_pos_reg_offset(pos));
+}
+
+fn get_switch_pos_input_reg_offset(pos: switch_pos) u16 {
+  return get_switch_pos_reg_offset(pos) + 5;
+}
+
+// Although SDR can configure both input switch and output switch at the same position,
+// this API only configures either input or output.
+// It also configures one direction only.
+fn set_switch_pos(pos: switch_pos, switch_addr: reg_type, color_addr: reg_type,
+                  comptime dir: direction, switch_kind: switch_select) void {
+  var r_switch_state =
+      @get_config(switch_addr + get_switch_pos_reg(pos), switch_addr_range);
+  // clear bits i+7:i+5 position input select
+  // clear bits i+4:i position output <dir> enable
+  r_switch_state &= get_clear_switch_pos_mask(pos);
+  const dir_val: u16 = switch_direction_encoding(dir);
+  r_switch_state |= switch (switch_kind) {
+    // dir_val is an encoding number
+    switch_select.INPUT => dir_val << get_switch_pos_input_reg_offset(pos),
+    // dir_val is a bit position
+    switch_select.OUTPUT => @as(u16, 1) <<
+                            (dir_val + get_switch_pos_reg_offset(pos)),
+  };
+  // propagate other switch from previous position
+  var prev_state = switch (pos) {
+    switch_pos.POS1 => @get_config(color_addr, color_addr_range),
+    switch_pos.POS2 => @get_config(switch_addr + @get_int(field.CONFIG0),
+                                   switch_addr_range),
+    switch_pos.POS3 => r_switch_state, // pos3 and pos2 are in the same register
+  };
+  prev_state &= @get_int(switch (switch_kind) {
+    switch_select.INPUT => switch_status.SELECT_OUTPUT_POS0_1_2,
+    switch_select.OUTPUT => switch_status.SELECT_INPUT_POS0_1_2,
+  });
+  r_switch_state |= prev_state;
+  @set_config(switch_addr, r_switch_state, switch_addr_range);
+}
+
+fn set_rxtx_switch_pos(pos: switch_pos, switch_addr: reg_type,
+                       comptime dir_rx: direction,
+                       comptime dir_tx: direction) void {
+  var r_switch_state =
+      @get_config(switch_addr + get_switch_pos_reg(pos), switch_addr_range);
+  // clear bits i+7:i+5 pos3 input select
+  // clear bits i+4:i pos3 output <dir> enable
+  r_switch_state &= get_clear_switch_pos_mask(pos);
+
+  const dir_rx_val: u16 = switch_direction_encoding(dir_rx);
+  const dir_tx_val: u16 = switch_direction_encoding(dir_tx);
+  // dir_rx_val is an encoding number
+  r_switch_state |= dir_rx_val << get_switch_pos_input_reg_offset(pos);
+  // dir_tx_val is a bit position
+  r_switch_state |= @as(u16, 1) << (dir_tx_val + get_switch_pos_reg_offset(pos));
+
+  @set_config(switch_addr, r_switch_state, switch_addr_range);
+}
+
+// The current switch position is in fabric color status register.
+//
+// SDR separates the input switch and the output switch.
+// This API only specifies one parameter "init_pos" which is
+// both input switch position and output switch position.
+fn set_current_switch_position(addr: reg_type, init_pos: u16) void {
+
+  var r_switch_state =
+      @get_config(addr + @as(reg_type, field.CONFIG0), switch_addr_range);
+  // clear bits 3:0
+  r_switch_state &= @get_int(switch_status.CLEAR_CURRENT_POS);
+  // reconfigure the current switch position, including input and output
+  r_switch_state += (init_pos << INPUT_SWITCH_CUR_POS) + ((init_pos << OUTPUT_SWITCH_CUR_POS));
+  @set_config(addr, r_switch_state, switch_addr_range);
+}
+
+// Input queue
+
+const REGS_PER_INPUT_QUEUE = 2;
+const NUM_INPUT_QUEUES = 8;
+
+// Output queue
+
+const REGS_PER_OUTPUT_QUEUE = 1;
+const NUM_OUTPUT_QUEUES = 8;
+
+// FIFOs
+const FIFO_MIN_ALIGNMENT = 16;

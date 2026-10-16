@@ -1,0 +1,19 @@
+{
+  "name": "docs",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev": "slidev gqa-decode-slides.md",
+    "build": "slidev build gqa-decode-slides.md --out slides-dist",
+    "export": "slidev export gqa-decode-slides.md --output slides.pdf"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@slidev/cli": "^52.13.0",
+    "@slidev/theme-default": "^0.25.0"
+  }
+}

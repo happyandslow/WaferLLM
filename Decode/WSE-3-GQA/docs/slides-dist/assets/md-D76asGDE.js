@@ -1,0 +1,10 @@
+import{_ as o}from"./slidev/CodeBlockWrapper.vue_vue_type_script_setup_true_lang-Y6JzWGb8.js";import{o as r,b as d,w as n,g as s,d as u,m as _,ad as e,v as c,x as m,T as l}from"./modules/vue-BOv15R7L.js";import{I as h}from"./slidev/default-CcpGrEgI.js";import{u as f,f as g}from"./slidev/context-CcvBypts.js";import"./modules/unplugin-icons-B5zimWMt.js";import"./index-B7XA2VA6.js";import"./modules/shiki-RcwD2jZ3.js";const B={__name:"gqa-decode-slides.md__slidev_4",setup(k){const{$clicksContext:p,$frontmatter:i}=f();return p.setup(),(x,a)=>{const t=o;return r(),d(h,c(m(l(g)(l(i),3))),{default:n(()=>[a[1]||(a[1]=s("h2",null,"PE Grid Layout",-1)),u(t,_({},{title:"",ranges:[]}),{default:n(()=>[...a[0]||(a[0]=[s("pre",{class:"shiki shiki-themes vitesse-dark vitesse-light slidev-code",style:{"--shiki-dark":"#dbd7caee","--shiki-light":"#393a34","--shiki-dark-bg":"#121212","--shiki-light-bg":"#ffffff"}},[s("code",{class:"language-text"},[s("span",{class:"line"},[s("span",null,"X-axis (px): partitions dim")]),e(`
+`),s("span",{class:"line"},[s("span",null,"  head 0       head 1       head 2       head 3")]),e(`
+`),s("span",{class:"line"},[s("span",null,"┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐")]),e(`
+`),s("span",{class:"line"},[s("span",null,"│PE 0..7   │ │PE 8..15  │ │PE 16..23 │ │PE 24..31 │")]),e(`
+`),s("span",{class:"line"},[s("span",null,"│pes_p_head│ │pes_p_head│ │pes_p_head│ │pes_p_head│")]),e(`
+`),s("span",{class:"line"},[s("span",null,"└──────────┘ └──────────┘ └──────────┘ └──────────┘")]),e(`
+`),s("span",{class:"line"},[s("span")]),e(`
+`),s("span",{class:"line"},[s("span",null,"Y-axis (py): partitions seq_len")]),e(`
+`),s("span",{class:"line"},[s("span",null,"  PE (px, py) holds K^T rows aligned with Q, at seq positions")]),e(`
+`),s("span",{class:"line"},[s("span",null,"  [py·seq_len_p_pe : (py+1)·seq_len_p_pe]")])])],-1)])]),_:1},16),a[2]||(a[2]=s("p",null,[s("strong",null,"Key constraint:"),e(),s("code",null,"n_heads | group_num"),e(" → head boundaries align with communication group boundaries → "),s("code",null,"groups_per_head = group_num / n_heads")],-1))]),_:1},16)}}};export{B as default};

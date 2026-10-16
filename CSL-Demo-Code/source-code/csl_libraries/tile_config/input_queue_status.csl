@@ -1,0 +1,60 @@
+param target : imported_module;
+
+const addresses = target.addresses;
+const reg_type = target.reg_type;
+const word_size = target.word_size;
+
+// Type representing input queue status.
+const status = struct {
+  // Bit mask representing queue-empty status. The queue with index 'i' is
+  // empty if the 'i'th bit is 1.
+  empty: u8,
+  // Bit mask representing queue-full status. The queue with index 'i' is full
+  // if the 'i'th bit is 1.
+  full: u8,
+};
+
+// Returns true if 's' indicates that all input queues are full.
+fn all_full(s: status) bool {
+  return s.full == 0xff;
+}
+
+// Returns true if 's' indicates that no input queues are full.
+fn none_full(s: status) bool {
+  return s.full == 0x00;
+}
+
+// Returns true if 's' indicates that all input queues are empty.
+fn all_empty(s: status) bool {
+  return s.empty == 0xff;
+}
+
+// Returns true if 's' indicates that no input queues are empty.
+fn none_empty(s: status) bool {
+  return s.empty == 0x00;
+}
+
+// Returns true if 's' indicates that 'q' is empty.
+fn is_empty(s: status, q: input_queue) bool {
+  return s.empty & (@as(u8, 1) << @get_int(q)) != 0;
+}
+
+// Returns true if 's' indicates that 'q' is empty.
+fn is_full(s: status, q: input_queue) bool {
+  return s.full & (@as(u8, 1) << @get_int(q)) != 0;
+}
+
+// Reads the input queue status register and returns its raw value.
+fn get_raw() reg_type {
+  return @get_config(@get_int(addresses.INPUT_QUEUE_STATUS) / word_size);
+}
+
+// Reads and decodes the input queue status register, returning an object of
+// type 'status' representing the input queue status.
+fn get() status {
+  const raw = get_raw();
+  return status {
+    .empty = @as(u8, raw & 0xff),
+    .full = @as(u8, raw >> 8)
+  };
+}

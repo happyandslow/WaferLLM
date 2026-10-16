@@ -19,3 +19,9 @@ wio_flows*/
 
 **/compile_out/*
 !**/compile_out/.gitkeep
+# local tooling / nested clones
+node_modules/
+CSL-document/
+.claude/
+__pycache__/
+*.pyc

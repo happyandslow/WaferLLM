@@ -1,0 +1,59 @@
+diff --git a/Decode/WSE-3-GQA/src/decode.csl b/Decode/WSE-3-GQA/src/decode.csl
+index 1001052..e9d4824 100644
+--- a/Decode/WSE-3-GQA/src/decode.csl
++++ b/Decode/WSE-3-GQA/src/decode.csl
+@@ -754,8 +754,6 @@ fn score_matvec_mult() void {
+ 
+     // Snapshot 5a: copy full score buffer
+     for (@range(i16, gqa_group_size * bsz * max_seq_len_p_pe)) |i| { score_post_gemv[i] = score[i]; }
+-    simprint.print_string(" score_dsd pre reduce: ");
+-    simprint_pe_coords_dsd(score_post_gemv_dsd);
+ 
+     // Phase 2: ONE batched variable-length KV-head-scoped X-reduce over all groups
+     comm_mod.all_reduce_bsz_g_var_seq_len_kv_head_scoped(px_in_kv_head, quotient_x_in_kv_head, remainder_x, ptr_score, iter_num);
+@@ -818,8 +816,6 @@ fn softmax_score_all_groups() void {
+     @map(fsubh_func, local_max_g_dsd);
+ 
+     @map(fast_exp, score_tmp_dsd, score_dsd);
+-    simprint.print_string(" score_dsd post exp: ");
+-    simprint_pe_coords_dsd(score_dsd);
+ 
+     score_dsd = @set_dsd_length(score_dsd, @bitcast(u16, bsz * max_seq_len_p_pe * gqa_group_size));
+     score_dsd = @set_dsd_base_addr(score_dsd, ptr_score);
+@@ -879,6 +875,11 @@ fn output_matvec_mult_all_groups() void {
+     // Using the original vecmat_computation pattern: reset V, use save_address=true
+     // for auto-advancing through V rows during the GEMV.
+ 
++    simprint.print_string(" score_dsd: ");
++    simprint_pe_coords_dsd(score_dsd);
++    simprint.print_string(" XV values: ");
++    simprint_pe_coords_dsd(XVCache_dsd);
++
+     left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_score);
+     out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_output);
+     ptr_right_matrix = &XVCache_tile;
+@@ -889,16 +890,22 @@ fn output_matvec_mult_all_groups() void {
+     right_matrix_dsd = @set_dsd_length(right_matrix_dsd, @bitcast(u16, Nt));
+     out_vector_dsd = @set_dsd_length(out_vector_dsd, @bitcast(u16, Nt));
+ 
+-    for (@range(i16, bsz * gqa_group_size)) |_| {
++    for (@range(i16, bsz * gqa_group_size)) |i| {
++
+         // RESET V to cache base — V is unbatched, same for every (b,g).
+         right_matrix_dsd = @set_dsd_base_addr(right_matrix_dsd, ptr_right_matrix);
++        simprint.print_string(" right_matrix_dsd: ");
++        simprint_pe_coords_dsd(right_matrix_dsd);
++        simprint.print_string(" left_vector_dsd: ");
++        simprint_pe_coords_dsd(left_vector_dsd);
+ 
+         @load_to_dsr(dest_dsr_1, out_vector_dsd, .{ .save_address = false });
+         @load_to_dsr(src0_dsr_1, out_vector_dsd, .{ .save_address = false });
+         @load_to_dsr(src1_dsr_1, right_matrix_dsd, .{ .save_address = true });
+ 
+         @map(gemv_static_step, left_vector_dsd);
+-
++        simprint.print_string(" out_vector_dsd: ");
++        simprint_pe_coords_dsd(out_vector_dsd);
+         left_vector_dsd = @increment_dsd_offset(left_vector_dsd, Kt, f16);
+         out_vector_dsd = @increment_dsd_offset(out_vector_dsd, Nt, f16);
+     }

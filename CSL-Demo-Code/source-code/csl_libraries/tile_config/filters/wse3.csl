@@ -1,0 +1,143 @@
+param target : imported_module;
+
+const common =
+    @import_module("<tile_config/filters/common>", .{.target = target});
+
+const reg_type = target.reg_type;
+const double_reg_type = target.double_reg_type;
+const word_size = target.word_size;
+const field = target.field;
+
+// Filter configuration functions.
+//////////////////////////////////
+
+const max_counter_width = (word_size * 8) - 1;
+
+// Set the drop_count of the wse3 counter filter given a 'limit' value
+// that has the wse2 semantics. This method will read 'MAX_PASS' and
+// therefore the user needs to make sure that `set_max_counter` is called
+// prior to `set_active_limit`, if needed.
+fn set_active_limit(filter_id: u16, limit: reg_type) void {
+  @assert(limit < (1 << max_counter_width));
+  const double_limit = limit * 2;
+  const pass_count = common.get_config(filter_id, field.MAX_PASS) - 1;
+  const drop_count = if (double_limit < pass_count) 0 else (double_limit - pass_count);
+  common.set_config(filter_id, field.DROP_COUNT, drop_count);
+}
+
+// Set the maximum counter value of a counter filter identified by `filter_id`
+// to `max_counter`.
+fn set_max_counter(filter_id: u16, max_counter: reg_type) void {
+  @assert(max_counter < (1 << max_counter_width));
+  common.set_config(filter_id, field.MAX_PASS, max_counter * 2 + 1);
+}
+
+const state_offset = 6;
+
+// Set the initial counter depending on whether the provied 'counter'
+// value is greater than 'pass_count' or not and set the state of
+// the filter accordingly.
+fn set_counter(filter_id: u16, counter: reg_type) void {
+  @assert(counter < (1 << max_counter_width));
+  const pass_count = common.get_config(filter_id, field.MAX_PASS);
+  const double_counter = counter * 2;
+  const state_is_drop = double_counter > pass_count;
+  common.set_config(filter_id, field.STATE,
+                    @as(reg_type, state_is_drop) << state_offset);
+  const counter_value =
+      if (state_is_drop) double_counter - pass_count + 1 else double_counter;
+  common.set_config(filter_id, field.COUNTER, counter_value);
+}
+
+const counter_filter_state = enum(reg_type) {
+  PASS = 0,
+  DROP = 1
+};
+
+const bits_per_word: u16 = 8 * word_size;
+const max_half_wavelet_count = 1 << 22;
+
+fn set_half_wavelet_count(filter_id: u16, value: double_reg_type,
+                          field_start: field) void {
+  const high_word = @as(reg_type, value >> bits_per_word);
+  const low_word =
+      @as(reg_type, value & ~@as(double_reg_type, 1 << bits_per_word));
+  common.set_config(filter_id, field_start, low_word);
+  common.set_config(filter_id,
+                    @as(field, @get_int(field_start) + word_size), high_word);
+}
+
+// For the counter filter identified by `filter_id`, set its pass/drop state to
+// `state` and counter value to `counter` half-wavelets.
+fn set_counter_and_state(filter_id: u16, counter: double_reg_type,
+                         state: counter_filter_state) void {
+  @assert(counter < max_half_wavelet_count);
+
+  const encoding = counter |
+                   (@as(double_reg_type, @get_int(state))
+                       << (state_offset + bits_per_word));
+  set_half_wavelet_count(filter_id, encoding, field.COUNTER);
+}
+
+// Set the counter value of the counter filter identified by `filter_id` to
+// `counter` half-wavelets.
+fn set_counter_value(filter_id: u16, counter: double_reg_type) void {
+  set_counter_and_state(filter_id, counter, get_state(filter_id));
+}
+
+fn get_half_wavelet_count(filter_id: u16, field_start: field) double_reg_type {
+  const high_word =
+      common.get_config(filter_id,
+                        @as(field, @get_int(field_start) + word_size));
+  const low_word = common.get_config(filter_id, field_start);
+  return (@as(double_reg_type, high_word) << bits_per_word) |
+          @as(double_reg_type, low_word);
+}
+
+// Get the counter value of the counter filter identified by `filter_id` as a
+// number of half-wavelets.
+fn get_counter_value(filter_id: u16) double_reg_type {
+  return get_half_wavelet_count(filter_id, field.COUNTER)
+         & ~@as(double_reg_type, 1 << (state_offset + bits_per_word));
+}
+
+// Set the pass/drop state of the counter filter identified by `filter_id` to
+// `state`.
+fn set_state(filter_id: u16, state: counter_filter_state) void {
+  const state_cleared = common.get_config(filter_id, field.STATE) &
+                        ~@as(reg_type, 1 << state_offset);
+  const new_state = state_cleared | (@get_int(state) << state_offset);
+  common.set_config(filter_id, field.STATE, new_state);
+}
+
+// Get the pass/drop state of the counter filter identified by `filter_id`.
+fn get_state(filter_id: u16) counter_filter_state {
+  return @as(counter_filter_state,
+             common.get_config(filter_id, field.STATE) >> state_offset);
+}
+
+// Set the pass count of the counter filter identified by `filter_id` to `count`
+// half-wavelets.
+fn set_pass_count(filter_id: u16, count: double_reg_type) void {
+  @assert(count < max_half_wavelet_count);
+  set_half_wavelet_count(filter_id, count, field.MAX_PASS);
+}
+
+// Get the pass count of the counter filter identified by `filter_id` as a
+// number of half-wavelets.
+fn get_pass_count(filter_id: u16) double_reg_type {
+  return get_half_wavelet_count(filter_id, field.MAX_PASS);
+}
+
+// Set the drop count of the counter filter identified by `filter_id` to `count`
+// half-wavelets.
+fn set_drop_count(filter_id: u16, count: double_reg_type) void {
+  @assert(count < max_half_wavelet_count);
+  set_half_wavelet_count(filter_id, count, field.DROP_COUNT);
+}
+
+// Get the drop count of the counter filter identified by `filter_id` as a
+// number of half-wavelets.
+fn get_drop_count(filter_id: u16) double_reg_type {
+  return get_half_wavelet_count(filter_id, field.DROP_COUNT);
+}

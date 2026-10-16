@@ -1,0 +1,46 @@
+
+param in_color: color;
+param out_color: color;
+
+param buffer_size: u16;
+
+const in_q = @get_input_queue(0);
+const out_q = @get_output_queue(1);
+
+const infinite_len = 0x7fff;
+
+const fabin = @get_dsd(fabin_dsd, .{.extent = infinite_len,
+                                    .fabric_color = in_color,
+                                    .input_queue = in_q});
+
+const fabout = @get_dsd(fabout_dsd, .{.extent = infinite_len,
+                                      .fabric_color = out_color,
+                                      .output_queue = out_q});
+
+// The element type of the FIFO buffer is not important.
+// We could pick f32 or any other scalar type. The I/O
+// port code should treat the buffer as raw data. We
+// picked 32-bit type as it is the largest unit of
+// transfer by the hardware. This may be revised in the
+// future.
+var fifo_buffer = @zeros([buffer_size]u32);
+const fifo = @allocate_fifo(fifo_buffer);
+
+const main_id = @get_local_task_id(8);
+task main() void {
+  // The I/O port code should be agnostic of bitwidth. The consumer
+  // and producer is responsible for that. Here, we use 32-bit
+  // moves because it is the largest move we can make.
+  @mov32(fifo, fabin, .{.async = true});
+  @mov32(fabout, fifo, .{.async = true});
+}
+
+comptime {
+  @bind_local_task(main, main_id);
+  @activate(main_id);
+
+  @initialize_queue(in_q, .{.color = in_color});
+  if (@is_arch("wse3")) {
+    @initialize_queue(out_q, .{.color = out_color});
+  }
+}

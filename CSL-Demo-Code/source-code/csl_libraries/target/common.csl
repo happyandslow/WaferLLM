@@ -1,0 +1,56 @@
+const word_size = 2;
+const reg = u16;
+const double_reg = u32;
+
+const prng_count = 4;
+const prng_size = 2 * word_size;
+
+const tsc_size_words = 3;
+
+const main_thread_priority_offset: reg = 5;
+const main_thread_priority_level = enum(reg) {
+  MEDIUM_LOW = 0b00,
+  MEDIUM = 0b01,
+  MEDIUM_HIGH = 0b10,
+  HIGH = 0b11
+};
+
+const NUM_COLORS = 24;
+const REGS_PER_COLOR = 1;
+
+const switch_select = enum(reg) {
+  INPUT = 1,
+  OUTPUT = 0
+};
+
+// Values of the switch direction field
+const SWITCH_WEST: u16 = 0;
+const SWITCH_EAST: u16 = 1;
+const SWITCH_SOUTH: u16 = 2;
+const SWITCH_NORTH: u16 = 3;
+const SWITCH_RAMP: u16 = 4;
+const SWITCH_INVALID: u16 = 5;
+
+// 5 = INVALID, 4 = CE, 3 = N, 2 = S, 1 = E, 0 = W
+fn switch_direction_encoding(comptime dir: direction) u16 {
+  if (dir == WEST) {
+    return SWITCH_WEST;
+  } else if (dir == EAST) {
+    return SWITCH_EAST;
+  } else if (dir == SOUTH) {
+    return SWITCH_SOUTH;
+  } else if (dir == NORTH) {
+    return SWITCH_NORTH;
+  } else if (dir == RAMP){
+    return SWITCH_RAMP;
+  } else {
+    @comptime_assert(false);
+  }
+}
+
+// SW-127154: this is a baroque way of emulating '... = struct { u16, u16 };'
+const addr_range_ty = @type_of(.{@as(reg, 0), @as(reg, 0)});
+inline fn get_addr_range_specifier(base_addr_words: reg, num_regs: reg,
+                            words_per_reg: reg) addr_range_ty {
+  return .{base_addr_words, base_addr_words + num_regs * words_per_reg - 1};
+}

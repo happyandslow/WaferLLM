@@ -1,0 +1,3 @@
+param target: imported_module;
+
+const all_queues_mask: u8 = (1 << target.NUM_OUTPUT_QUEUES) - 1;

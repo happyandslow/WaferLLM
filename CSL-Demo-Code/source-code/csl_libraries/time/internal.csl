@@ -1,0 +1,67 @@
+// Private Interface
+const config = @import_module("<tile_config>");
+
+fn set_tsc_ctrl_reg(value : u16) void {
+  @set_config(@as(u16, config.addresses.PERF_COUNTER_CONTROL) /
+              config.word_size, value);
+}
+
+fn read_tsc_ctrl_reg() u16 {
+  return @get_config(@as(u16, config.addresses.PERF_COUNTER_CONTROL) /
+                     config.word_size);
+}
+
+// This is in little endian order, so least significant word of timestamp is in
+// timestamp[0]
+fn get_value(result : *[tsc_size_words]u16, base_words: u16) void {
+  inline for (@range(u16, tsc_size_words)) |i| {
+    (result.*)[i] = @get_config(base_words + i);
+  }
+}
+
+fn get_perf_cntr_base_word(cntr_id: i16) u16 {
+  if (cntr_id == 0) {
+    return @get_int(config.addresses.PERF_CNTR0) / config.word_size;
+  } else if (cntr_id == 1) {
+    return @get_int(config.addresses.PERF_CNTR1) / config.word_size;
+  } else {
+    @assert(false);
+    return 0;
+  }
+}
+
+// Public Interface
+const tsc_size_words = config.target.tsc_size_words;
+
+fn enable_tsc() void {
+  set_tsc_ctrl_reg(7);
+
+  // automatically reset the timestamps to avoid a random number
+  reset_tsc_counter();
+}
+
+fn disable_tsc() void {
+  set_tsc_ctrl_reg(0);
+}
+
+fn get_timestamp(result : *[tsc_size_words]u16) void {
+  const base_words = @get_int(config.addresses.TIMESTAMP_COUNTER) / config.word_size;
+  get_value(result, base_words);
+}
+
+// Read the HW performance counter with the given ID.
+fn get_perf_cntr(result : *[tsc_size_words]u16, cntr_id: i16) void {
+  const base_words = get_perf_cntr_base_word(cntr_id);
+  get_value(result, base_words);
+}
+
+// Timestamp counters on hardware begin execution as a random 48-bit number.
+// If the tsc wraps around between two timestamps, then the elapsed cycle
+// count is not useful. We can avoid wraparounds by resetting the tsc to 0.
+fn reset_tsc_counter() void {
+  const tsc_size_words = config.target.tsc_size_words;
+  const base_words = @get_int(config.addresses.TIMESTAMP_COUNTER) / config.word_size;
+  inline for (@range(u16, tsc_size_words)) |i| {
+    @set_config(base_words + i, 0);
+  }
+}

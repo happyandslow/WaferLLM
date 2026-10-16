@@ -1,0 +1,70 @@
+// CSL Code Pattern: Async FIFO Pipeline
+// H2D → FIFO → fabric color → process → D2H
+// SDK Version: 1.4.0 | Works on WSE-2 and WSE-3
+
+param memcpy_params: comptime_struct;
+param size: i16;
+param C1: color;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+
+const h2d_iq: input_queue = @get_input_queue(2);
+const d2h_oq: output_queue = @get_output_queue(3);
+const C1_iq: input_queue = @get_input_queue(4);
+const C1_oq: output_queue = @get_output_queue(4);
+
+// FIFO buffer — size determines max pipeline depth
+var fifo_buffer = @zeros([1024]i16);
+const fifo = @allocate_fifo(fifo_buffer);
+
+const INFINITE: u16 = 0x7fff;
+
+task main_task() void {
+    // H2D input (infinite extent — host controls actual length)
+    const h2d_in = @get_dsd(fabin_dsd, .{
+        .extent = INFINITE,
+        .fabric_color = sys_mod.MEMCPYH2D_1,
+        .input_queue = h2d_iq,
+    });
+
+    // Fabric output through color C1 (loopback or to neighbor)
+    const c1_out = @get_dsd(fabout_dsd, .{
+        .extent = INFINITE,
+        .fabric_color = C1,
+        .output_queue = C1_oq,
+    });
+
+    // Fabric input from C1
+    const c1_in = @get_dsd(fabin_dsd, .{
+        .extent = size,
+        .fabric_color = C1,
+        .input_queue = C1_iq,
+    });
+
+    // D2H output
+    const d2h_out = @get_dsd(fabout_dsd, .{
+        .extent = size,
+        .fabric_color = sys_mod.MEMCPYD2H_1,
+        .output_queue = d2h_oq,
+    });
+
+    const one = [1]i16{1};
+    const one_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{size} -> one[0] });
+
+    // Pipeline: H2D → FIFO → C1 → add 1 → D2H
+    @mov16(fifo, h2d_in, .{ .async = true });
+    @mov16(c1_out, fifo, .{ .async = true });
+    @add16(d2h_out, c1_in, one_dsd, .{ .async = true });
+}
+
+comptime {
+    @bind_local_task(main_task, @get_local_task_id(8));
+    @activate(@get_local_task_id(8));
+
+    if (@is_arch("wse3")) {
+        @initialize_queue(h2d_iq, .{ .color = sys_mod.MEMCPYH2D_1 });
+        @initialize_queue(d2h_oq, .{ .color = sys_mod.MEMCPYD2H_1 });
+        @initialize_queue(C1_iq, .{ .color = C1 });
+        @initialize_queue(C1_oq, .{ .color = C1 });
+    }
+}

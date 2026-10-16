@@ -1,0 +1,49 @@
+// CSL Code Pattern: WSE-3 Microthread Setup
+// Explicit microthread assignment for concurrent async operations.
+// SDK Version: 1.4.0 | WSE-3 only
+
+param memcpy_params: comptime_struct;
+param color_a: color;
+param color_b: color;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+
+// Queues
+const iq_a: input_queue = @get_input_queue(2);
+const oq_a: output_queue = @get_output_queue(2);
+const iq_b: input_queue = @get_input_queue(3);
+const oq_b: output_queue = @get_output_queue(3);
+
+// Microthread IDs — decoupled from queue IDs on WSE-3
+const ut0 = @get_ut_id(0);
+const ut1 = @get_ut_id(1);
+
+var result_a = @zeros([100]f32);
+var result_b = @zeros([100]f32);
+
+fn process() void {
+    const in_a = @get_dsd(fabin_dsd, .{
+        .extent = 100, .fabric_color = color_a, .input_queue = iq_a,
+    });
+    const in_b = @get_dsd(fabin_dsd, .{
+        .extent = 100, .fabric_color = color_b, .input_queue = iq_b,
+    });
+    const mem_a = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{100} -> result_a[i] });
+    const mem_b = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{100} -> result_b[i] });
+
+    // Two concurrent receives on different microthreads
+    @fmovs(mem_a, in_a, .{ .async = true, .ut_id = ut0 });
+    @fmovs(mem_b, in_b, .{ .async = true, .ut_id = ut1 });
+
+    sys_mod.unblock_cmd_stream();
+}
+
+comptime {
+    // WSE-3: must initialize all queues
+    @initialize_queue(iq_a, .{ .color = color_a });
+    @initialize_queue(oq_a, .{ .color = color_a });
+    @initialize_queue(iq_b, .{ .color = color_b });
+    @initialize_queue(oq_b, .{ .color = color_b });
+
+    @export_symbol(process);
+}

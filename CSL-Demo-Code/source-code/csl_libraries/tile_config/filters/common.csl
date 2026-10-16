@@ -1,0 +1,43 @@
+param target : imported_module;
+
+const num_filters = target.num_filters;
+const filter_bank_1_size = target.filter_bank_1_size;
+const addresses = target.addresses;
+const reg_type = target.reg_type;
+const word_size = target.word_size;
+const filter_size = target.filter_size;
+const filter_cfg_size = target.filter_cfg_size;
+
+const field = target.field;
+
+fn __make_filters() [num_filters]reg_type {
+  var f = @zeros([num_filters]reg_type);
+  for (@range(reg_type, num_filters)) |i| {
+    var base = if (i < filter_bank_1_size) addresses.FILTER else addresses.FILTER_BANK_2;
+    var ind = if (i < filter_bank_1_size) i else i - filter_bank_1_size;
+    f[i] = @as(reg_type, base) + ind * filter_size;
+  }
+  return f;
+}
+
+const filters = __make_filters();
+
+// SW-133596: @concat_structs(tuple, .{}) doesn't work, but it should, and could
+// allow this to be simplified
+const __bank_1_range = target.get_addr_range_specifier(
+    filters[0] / word_size, filter_bank_1_size, filter_size / word_size);
+const __bank_2_range = target.get_addr_range_specifier(
+    filters[filter_bank_1_size] / word_size, num_filters - filter_bank_1_size,
+    filter_size / word_size);
+const __addrs_ranges = if (filter_bank_1_size < num_filters)
+    .{__bank_1_range, __bank_2_range} else __bank_1_range;
+
+fn set_config(filter_id: u16, config: field, value: reg_type) void {
+  @set_config((filters[filter_id] + @as(reg_type, config)) / word_size, value,
+              __addrs_ranges);
+}
+
+fn get_config(filter_id: u16, config: field) u16 {
+  return @get_config((filters[filter_id] + @as(reg_type, config)) / word_size,
+                     __addrs_ranges);
+}
